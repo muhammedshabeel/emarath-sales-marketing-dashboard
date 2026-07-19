@@ -22,7 +22,7 @@ h1,h2,h3{letter-spacing:-.03em}.stMetric{background:#fff;border:1px solid #e9e7d
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 4
+ANALYSIS_SCHEMA_VERSION = 5
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -81,13 +81,15 @@ def excel_bytes(tables):
 with st.sidebar:
     st.header("Report controls")
     today = date.today()
-    start_date = st.date_input("DoubleTick attribution start date", today - timedelta(days=1))
-    end_date = st.date_input("DoubleTick attribution end date (inclusive)", today)
+    # Default to the latest completed 5 PM-to-5 PM reporting period. For
+    # example, on 19 July this is 17 July 5 PM through 18 July 5 PM.
+    start_date = st.date_input("DoubleTick attribution start date", today - timedelta(days=2))
+    end_date = st.date_input("DoubleTick attribution end date (inclusive)", today - timedelta(days=1))
     report_tz = st.selectbox("Report timezone", ["Asia/Dubai", "Asia/Kolkata"], format_func=lambda x: "GCC — Dubai (UTC+4)" if x == "Asia/Dubai" else "India — IST (UTC+5:30)")
     streak_gap = st.slider("Consecutive retry gap (minutes)", 1, 60, 15)
     st.divider()
     st.subheader("3CX analysis scope")
-    call_scope = st.radio("Calls to analyse", ["Custom date/time window", "Use all uploaded outbound calls"], index=0)
+    call_scope = st.radio("Calls to analyse", ["Custom date/time window", "Use all uploaded outbound calls"], index=0, help="Custom is the KPI reporting period. Use all uploaded calls only when the 3CX export itself is already trimmed to the exact period.")
     filter_calls = call_scope == "Custom date/time window"
     if filter_calls:
         call_start_date = st.date_input("3CX start date", start_date)
@@ -250,13 +252,14 @@ with tabs[2]:
     st.dataframe(orders.sort_values("sale_time", ascending=False), hide_index=True, use_container_width=True)
 
 with tabs[3]:
+    gcc_joined = joined[joined.lead_region.eq("GCC")]
     gcc_keys = set(joined.loc[joined.lead_region.eq("GCC"), "call_key"])
     gcc_calls = calls_in_window[calls_in_window.call_key.isin(gcc_keys)].copy()
     unmatched_calls = calls_in_window[~calls_in_window.call_key.isin(gcc_keys)].copy()
     c = st.columns(6)
     c[0].metric("Total calls", f"{int(joined.call_count.sum()):,}")
     c[1].metric("Unanswered calls", f"{int(joined.unanswered_calls.sum()):,}")
-    c[2].metric("Never-called leads", f"{(~joined.called).sum():,}")
+    c[2].metric("Never-called GCC leads", f"{(~gcc_joined.called).sum():,}")
     c[3].metric("Repeated unanswered", f"{int(joined.consecutive_unanswered_retries.sum()):,}")
     avg_speed = joined.speed_to_first_call_minutes.clip(lower=0).mean()
     c[4].metric("Avg speed to first call", f"{avg_speed:.0f} min" if pd.notna(avg_speed) else "N/A")
