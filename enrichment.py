@@ -132,6 +132,36 @@ def enrich_meta(ad_ids, token, workers=8, progress=None):
     return pd.DataFrame(rows, columns=columns)
 
 
+def generate_fixed_zip_report(phones, api_key, meta_token, wabas, start_date, end_date,
+                              doubletick_progress=None, meta_progress=None):
+    """Run the integrated ZIP workflow with a freshly replaced phone list.
+
+    ``phones`` is rebuilt exclusively from the current DoubleTick all-customer
+    upload on every click; no bundled or previous phone_numbers.txt is reused.
+    The returned frame is the generated doubletick_ad_id_report used by the
+    marketing dashboard and its downloadable workbook.
+    """
+    phone_list = list(dict.fromkeys(
+        re.sub(r"\D", "", str(value)) for value in phones
+        if len(re.sub(r"\D", "", str(value))) >= 8
+    ))
+    report = enrich_doubletick(
+        phone_list, api_key, wabas, start_date, end_date,
+        progress=doubletick_progress,
+    )
+    meta = enrich_meta(report.ad_id, meta_token, progress=meta_progress)
+    report["ad_id_join"] = report.ad_id.astype(str)
+    report = report.merge(meta, on="ad_id_join", how="left").drop(columns="ad_id_join")
+    meta_cols = ["meta_ad_name", "meta_adset_id", "meta_adset_name", "meta_campaign_id", "meta_campaign_name", "meta_lookup_status", "meta_error"]
+    for column in meta_cols:
+        if column not in report: report[column] = ""
+    report.loc[report.ad_id.eq(""), "meta_lookup_status"] = "NOT_LOOKED_UP"
+    report[meta_cols] = report[meta_cols].fillna("")
+    evidence_columns = [column for column in ("meta_campaign_name", "meta_adset_name", "meta_ad_name", "headline", "raw_ad_json") if column in report]
+    report["classification_text"] = report[evidence_columns].fillna("").astype(str).agg(" | ".join, axis=1)
+    return report
+
+
 def classify_campaign(name):
     text = re.sub(r"[_|\-]+", " ", str(name or "")).upper()
     text = re.sub(r"\s+", " ", text)
@@ -155,4 +185,13 @@ def classify_campaign(name):
         if product != "Unmapped": break
         if any(re.sub(r"[^A-Z0-9]", "", a.upper()) in compact for a in aliases):
             product = canonical; vendor = PRODUCT_VENDOR.get(product, "Unmapped"); break
+    # Country is inferred from the generated report's product evidence only
+    # when the campaign itself does not explicitly name a country.
+    if country == "Unmapped":
+        product_country = {
+            "AL HUDA": "UAE", "PREMIUM EDITION": "UAE", "DOE": "UAE",
+            "OUD LOVERS": "Bahrain", "ABSOLUTE MOUNTAIN": "KSA",
+            "HECTOR": "KSA", "VOLGA": "KSA",
+        }
+        country = product_country.get(product.upper(), country)
     return country, product, vendor
