@@ -34,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 10
+ANALYSIS_SCHEMA_VERSION = 11
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -111,6 +111,10 @@ def campaign_performance(joined, spend_data):
     performance["conversion_rate"] = performance["orders"].div(performance["leads"].replace(0, pd.NA)).mul(100)
     performance["cost_per_order"] = performance["spend"].div(performance["orders"].replace(0, pd.NA))
     performance["roas"] = performance["revenue"].div(performance["spend"].replace(0, pd.NA))
+    performance["campaign_name"] = performance["campaign_name"].fillna("Unmatched spend campaign").astype(str)
+    performance["conversion_rate"] = pd.to_numeric(performance["conversion_rate"], errors="coerce").fillna(0.0).astype(float)
+    performance["orders"] = pd.to_numeric(performance["orders"], errors="coerce").fillna(0).astype(int)
+    performance["spend"] = pd.to_numeric(performance["spend"], errors="coerce").fillna(0.0).astype(float)
     return performance.sort_values("spend", ascending=False)
 
 
@@ -371,7 +375,11 @@ with tabs[1]:
         "cost_per_order": st.column_config.NumberColumn("Cost/order (AED)", format="%.2f"),
         "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
     })
-    chart_data = campaign_market[campaign_market.spend.gt(0)].head(20)
+    chart_data = campaign_market[campaign_market.spend.gt(0)].head(20).copy()
+    chart_data["campaign_name"] = chart_data["campaign_name"].fillna("Unmatched spend campaign").astype(str)
+    chart_data["spend"] = pd.to_numeric(chart_data["spend"], errors="coerce").fillna(0.0).astype(float)
+    chart_data["conversion_rate"] = pd.to_numeric(chart_data["conversion_rate"], errors="coerce").fillna(0.0).astype(float)
+    chart_data["orders"] = pd.to_numeric(chart_data["orders"], errors="coerce").fillna(0).astype(int)
     fig = px.bar(chart_data, x="campaign_name", y="spend", color="conversion_rate", text="orders", title="Campaign spend and converted orders", color_continuous_scale=["#dceff3","#16856b"])
     fig.update_layout(xaxis_title="", yaxis_title="Spend (AED)", height=430)
     st.plotly_chart(fig, use_container_width=True)
