@@ -17,6 +17,9 @@ def normalize_leads(df, mapping, source_tz, report_tz):
     out["lead_phone"] = df[mapping["phone"]].astype(str)
     out["phone_key"] = last8(df[mapping["phone"]])
     out["call_key"] = phone_digits(df[mapping["phone"]]).str[-9:]
+    lead_digits = phone_digits(df[mapping["phone"]])
+    gcc_prefixes = ("971", "973", "974", "966", "996")
+    out["lead_region"] = lead_digits.map(lambda value: "GCC" if str(value).startswith(gcc_prefixes) else "Other country")
     out["lead_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
     out["agent_number"] = df[mapping["agent_number"]].fillna("").astype(str) if mapping.get("agent_number") else ""
     agent_digits = phone_digits(out.agent_number)
@@ -78,10 +81,8 @@ def normalize_calls(df, mapping, source_tz, report_tz):
     out["phone_key"] = call_digits.str[-8:]
     out["call_key"] = call_digits.str[-9:]
     out["call_number"] = call_digits
-    # 966 is the actual KSA calling code. Keep 996 as explicitly requested as
-    # well, so existing operational exports using it are not silently dropped.
-    gcc_prefixes = ("971", "973", "974", "966", "996")
-    out["call_region"] = call_digits.map(lambda value: "GCC" if str(value).startswith(gcc_prefixes) else "Other country")
+    # Do not classify calls by their displayed prefix. 3CX may dial the same
+    # GCC lead as 050..., 00971..., or +971.... Matching is by last 9 digits.
     out["call_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
     out["call_agent"] = df[mapping["agent"]].fillna("").astype(str).str.strip() if mapping.get("agent") else ""
     out["call_status"] = df[mapping["call_status"]].fillna("").astype(str).str.strip() if mapping.get("call_status") else ""
@@ -108,7 +109,7 @@ def _window(df, col, start, end, report_tz):
     return df[df[col].ge(lo) & df[col].lt(hi)].copy()
 
 
-def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minutes=15):
+def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minutes=15, filter_calls=False):
     # The DoubleTick export is authoritative: every uploaded row is an assigned
     # lead for the chosen reporting period. Never discard it using historical
     # customer timestamps such as First message received at.
@@ -117,19 +118,18 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     # DoubleTick assignment population. Created/Assigned Date can be date-only,
     # so filtering it at 17:00 would silently discard valid matched leads.
     sales = sales.copy()
-    # The uploaded 3CX export is already scoped to the intended reporting
-    # period. Keep every uploaded outbound row; do not impose a fixed time cut.
-    calls = calls.copy()
-    gcc_calls = calls[calls.call_region.eq("GCC")].copy()
+    # The window is user-selectable. When disabled, trust the full uploaded
+    # 3CX export. Never discard local-format destinations before last-9 matching.
+    calls = _window(calls, "call_time", start, end, report_tz) if filter_calls else calls.copy()
     sales_presence = sales.groupby("phone_key", dropna=False).size().rename("workpex_match_count").reset_index()
     orders = sales[sales.is_order].copy()
     if orders.order_id.ne("").any():
         orders = orders.sort_values("sale_time").drop_duplicates("order_id", keep="last")
     order_agg = orders.groupby("phone_key", dropna=False).agg(order_count=("is_order", "size"), order_value=("order_amount", "sum"), order_products=("order_product", lambda x: ", ".join(sorted(set(v for v in x if v))))).reset_index()
-    call_agg = gcc_calls.groupby("call_key", dropna=False).agg(call_count=("call_key", "size"), answered_calls=("answered", "sum"), talk_seconds=("duration_seconds", "sum"), first_call_time=("call_time", "min"), last_call_time=("call_time", "max")).reset_index()
+    call_agg = calls.groupby("call_key", dropna=False).agg(call_count=("call_key", "size"), answered_calls=("answered", "sum"), talk_seconds=("duration_seconds", "sum"), first_call_time=("call_time", "min"), last_call_time=("call_time", "max")).reset_index()
     call_agg["unanswered_calls"] = call_agg.call_count - call_agg.answered_calls
-    if not gcc_calls.empty:
-        seq = gcc_calls.sort_values(["call_agent", "call_time"]).copy()
+    if not calls.empty:
+        seq = calls.sort_values(["call_agent", "call_time"]).copy()
         prev_same = seq.call_key.eq(seq.call_key.shift()) & seq.call_agent.eq(seq.call_agent.shift())
         gap = seq.call_time.sub(seq.call_time.shift()).dt.total_seconds().div(60)
         seq["consecutive_unanswered_retry"] = (~seq.answered) & (~seq.answered.shift(fill_value=True)) & prev_same & gap.le(streak_gap_minutes)
@@ -145,8 +145,8 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     joined["workpex_reconciliation"] = "FOUND"
     joined.loc[~joined.workpex_found, "workpex_reconciliation"] = "MISSING FROM WORKPEX"
     joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE WORKPEX MATCHES"
-    joined["called"] = joined.call_count.gt(0)
-    joined["answered_any"] = joined.answered_calls.gt(0)
+    joined["called"] = joined.lead_region.eq("GCC") & joined.call_count.gt(0)
+    joined["answered_any"] = joined.lead_region.eq("GCC") & joined.answered_calls.gt(0)
     if joined.lead_time.notna().any():
         joined["speed_to_first_call_minutes"] = (joined.first_call_time - joined.lead_time).dt.total_seconds().div(60)
     else:
@@ -180,12 +180,12 @@ def qa_report(leads, sales, calls, source_ranges):
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
     rows.append({"check": "Uploaded source handling", "value": "DoubleTick + Workpex + 3CX trusted as prefiltered uploads", "severity": "OK"})
     lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key)
-    lead_call_keys = set(leads.call_key)
-    gcc_calls = calls[calls.call_region.eq("GCC")] if "call_region" in calls else calls
-    call_keys = set(gcc_calls.call_key)
+    gcc_leads = leads[leads.lead_region.eq("GCC")] if "lead_region" in leads else leads
+    lead_call_keys = set(gcc_leads.call_key)
+    call_keys = set(calls.call_key)
     rows.append({"check": "DoubleTick leads missing from Workpex", "value": len(lead_keys - sales_keys), "severity": "High" if lead_keys - sales_keys else "OK"})
     rows.append({"check": "DoubleTick leads absent from outbound GCC 3CX (last 9 digits)", "value": len(lead_call_keys - call_keys), "severity": "Review" if lead_call_keys - call_keys else "OK"})
     rows.append({"check": "Workpex rows unmatched to a lead", "value": len(sales_keys - lead_keys), "severity": "Review"})
     rows.append({"check": "GCC 3CX numbers unmatched to a lead", "value": len(call_keys - lead_call_keys), "severity": "Review"})
-    rows.append({"check": "Other-country outbound 3CX calls shown separately", "value": int(calls.call_region.eq("Other country").sum()) if "call_region" in calls else 0, "severity": "Review"})
+    rows.append({"check": "Other-country DoubleTick leads shown separately", "value": int(leads.lead_region.eq("Other country").sum()) if "lead_region" in leads else 0, "severity": "Review"})
     return pd.DataFrame(rows)
