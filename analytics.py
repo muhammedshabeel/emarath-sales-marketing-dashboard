@@ -37,6 +37,7 @@ def normalize_attribution(df, mapping):
     out["ad_id_attr"] = df[mapping["ad_id"]].fillna("").astype(str).str.replace(r"\.0$", "", regex=True) if mapping.get("ad_id") else ""
     out["campaign_name_attr"] = df[mapping["campaign"]].fillna("").astype(str).str.strip() if mapping.get("campaign") else ""
     out["attribution_status"] = df[mapping["status"]].fillna("").astype(str).str.strip() if mapping.get("status") else ""
+    out["classification_text_attr"] = df[mapping["classification"]].fillna("").astype(str).str.strip() if mapping.get("classification") else out["campaign_name_attr"]
     # One customer should have one attribution row. Prefer a row with campaign,
     # then Ad ID, while retaining duplicate counts for QA.
     out["attribution_match_count"] = out.groupby("phone_key").phone_key.transform("size")
@@ -48,6 +49,7 @@ def attach_attribution(leads, attribution):
     out = leads.merge(attribution, on="phone_key", how="left")
     out["ad_id"] = out.ad_id_attr.fillna("")
     out["campaign_name"] = out.campaign_name_attr.fillna("")
+    out["classification_text"] = out.classification_text_attr.fillna(out["campaign_name"])
     out["attribution_found"] = out.attribution_phone.notna()
     out["attribution_match_count"] = out.attribution_match_count.fillna(0).astype(int)
     return out
@@ -151,7 +153,8 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
         joined["speed_to_first_call_minutes"] = (joined.first_call_time - joined.lead_time).dt.total_seconds().div(60)
     else:
         joined["speed_to_first_call_minutes"] = float("nan")
-    classifications = joined.campaign_name.map(classify_campaign).apply(pd.Series)
+    classification_source = joined["classification_text"] if "classification_text" in joined else joined.campaign_name
+    classifications = classification_source.map(classify_campaign).apply(pd.Series)
     classifications.columns = ["country", "product", "vendor"]
     joined[["country", "product", "vendor"]] = classifications
     joined["lead_date"] = joined.lead_time.dt.date
