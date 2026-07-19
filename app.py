@@ -1,6 +1,6 @@
 from __future__ import annotations
 import io
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -21,6 +21,11 @@ h1,h2,h3{letter-spacing:-.03em}.stMetric{background:#fff;border:1px solid #e9e7d
 
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
+
+ANALYSIS_SCHEMA_VERSION = 4
+if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
+    st.session_state.pop("analysis_results", None)
+    st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
 
 
 def secret(name, default=""):
@@ -81,6 +86,20 @@ with st.sidebar:
     report_tz = st.selectbox("Report timezone", ["Asia/Dubai", "Asia/Kolkata"], format_func=lambda x: "GCC — Dubai (UTC+4)" if x == "Asia/Dubai" else "India — IST (UTC+5:30)")
     streak_gap = st.slider("Consecutive retry gap (minutes)", 1, 60, 15)
     st.divider()
+    st.subheader("3CX analysis scope")
+    call_scope = st.radio("Calls to analyse", ["Custom date/time window", "Use all uploaded outbound calls"], index=0)
+    filter_calls = call_scope == "Custom date/time window"
+    if filter_calls:
+        call_start_date = st.date_input("3CX start date", start_date)
+        call_start_time = st.time_input("3CX start time", time(17, 0), step=timedelta(minutes=15))
+        call_end_date = st.date_input("3CX end date", end_date)
+        call_end_time = st.time_input("3CX end time", time(17, 0), step=timedelta(minutes=15))
+        call_start = pd.Timestamp.combine(call_start_date, call_start_time).tz_localize(report_tz)
+        call_end = pd.Timestamp.combine(call_end_date, call_end_time).tz_localize(report_tz)
+    else:
+        call_start = pd.Timestamp(start_date).tz_localize(report_tz)
+        call_end = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).tz_localize(report_tz)
+    st.divider()
     st.subheader("Source timezones")
     tz_options = ["Asia/Dubai", "Asia/Kolkata"]
     dt_tz = st.selectbox("DoubleTick", tz_options, 0, help="Used for lead-time and speed-to-call only. It never removes rows from the DoubleTick upload.")
@@ -89,11 +108,13 @@ with st.sidebar:
 
 if start_date > end_date:
     st.error("Start date must not be after end date."); st.stop()
+if filter_calls and call_start >= call_end:
+    st.error("3CX analysis start must be before its end."); st.stop()
 
 st.info(
     f"Attribution API dates: {start_date.strftime('%d/%m/%Y')} → {end_date.strftime('%d/%m/%Y')} inclusive. "
-    "The uploaded DoubleTick, Workpex and 3CX reports are treated as prefiltered, authoritative datasets. "
-    "The dashboard analyzes every uploaded row without imposing a fixed reporting-time window."
+    "DoubleTick and Workpex uploads are authoritative. "
+    + (f"3CX custom window: {call_start.strftime('%d/%m/%Y %I:%M %p')} → {call_end.strftime('%d/%m/%Y %I:%M %p')} ({report_tz})." if filter_calls else "Every uploaded outbound 3CX row will be analysed.")
 )
 
 st.subheader("1. Upload the three source reports")
@@ -155,7 +176,7 @@ if submitted:
     attribution = normalize_attribution(dt_report, {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status"})
     leads = attach_attribution(leads, attribution)
     bar.empty()
-    joined, orders, calls_in_window = build_analysis(leads, sales, calls, start_date, end_date, report_tz, streak_gap)
+    joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
     ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Workpex upload": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
     st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report)
@@ -174,20 +195,24 @@ tabs = st.tabs(["Executive", "Marketing", "Sales", "3CX calls", "Agent performan
 
 with tabs[0]:
     total_leads, total_orders = len(joined), int(joined.order_count.sum())
-    metrics = st.columns(7)
+    gcc_leads = joined[joined.lead_region.eq("GCC")]
+    other_leads = joined[joined.lead_region.eq("Other country")]
+    metrics = st.columns(8)
     metrics[0].metric("Leads", f"{total_leads:,}")
     metrics[1].metric("Orders", f"{total_orders:,}")
     metrics[2].metric("Conversion", f"{total_orders / total_leads * 100:.1f}%")
-    metrics[3].metric("Never called", f"{(~joined.called).sum():,}")
-    metrics[4].metric("Answered leads", f"{joined.answered_any.sum():,}")
-    metrics[5].metric("Unmapped campaigns", f"{joined.country.eq('Unmapped').sum():,}")
-    metrics[6].metric("Missing in Workpex", f"{(~joined.workpex_found).sum():,}")
+    metrics[3].metric("GCC leads", f"{len(gcc_leads):,}")
+    metrics[4].metric("Never called — GCC", f"{(~gcc_leads.called).sum():,}")
+    metrics[5].metric("Answered GCC leads", f"{gcc_leads.answered_any.sum():,}")
+    metrics[6].metric("Other-country leads", f"{len(other_leads):,}")
+    metrics[7].metric("Missing in Workpex", f"{(~joined.workpex_found).sum():,}")
     daily = grouped(joined, "lead_date")
-    fig = px.line(daily, x="lead_date", y=["leads", "orders", "called_leads"], markers=True, title="Daily funnel")
+    daily["lead_date"] = daily["lead_date"].astype(str)
+    fig = px.bar(daily, x="lead_date", y=["leads", "orders", "called_leads"], barmode="group", title="Reporting-period funnel")
     st.plotly_chart(fig, use_container_width=True)
     failures = pd.DataFrame({
         "failure point": ["No call made", "Called but never answered", "Answered but no order", "Campaign not classified"],
-        "leads": [(~joined.called).sum(), (joined.called & ~joined.answered_any).sum(), (joined.answered_any & ~joined.converted).sum(), joined.country.eq("Unmapped").sum()],
+        "leads": [(~gcc_leads.called).sum(), (gcc_leads.called & ~gcc_leads.answered_any).sum(), (gcc_leads.answered_any & ~gcc_leads.converted).sum(), joined.country.eq("Unmapped").sum()],
     }).sort_values("leads", ascending=False)
     st.dataframe(failures, hide_index=True, use_container_width=True)
 
@@ -200,7 +225,11 @@ with tabs[1]:
     fig = px.bar(market.head(20), x=view, y="leads", color="conversion_rate", text="orders", title=f"Leads and orders by {view.replace('_',' ')}")
     st.plotly_chart(fig, use_container_width=True)
     st.markdown("#### Attribution/classification exceptions")
-    exceptions = joined[joined.country.eq("Unmapped") | joined.product.eq("Unmapped")][["lead_phone", "ad_id", "campaign_name", "attribution_status", "country", "product", "vendor"]].copy()
+    country_values = joined["country"] if "country" in joined else pd.Series("Unmapped", index=joined.index)
+    product_values = joined["product"] if "product" in joined else pd.Series("Unmapped", index=joined.index)
+    exception_mask = country_values.eq("Unmapped") | product_values.eq("Unmapped")
+    exception_columns = [column for column in ["lead_phone", "ad_id", "campaign_name", "attribution_status", "country", "product", "vendor"] if column in joined.columns]
+    exceptions = joined.loc[exception_mask, exception_columns].copy()
     if exceptions.empty:
         st.success("Every generated campaign was classified.")
     else:
@@ -224,8 +253,9 @@ with tabs[2]:
     st.dataframe(orders.sort_values("sale_time", ascending=False), hide_index=True, use_container_width=True)
 
 with tabs[3]:
-    gcc_calls = calls_in_window[calls_in_window.call_region.eq("GCC")].copy()
-    other_calls = calls_in_window[calls_in_window.call_region.eq("Other country")].copy()
+    gcc_keys = set(joined.loc[joined.lead_region.eq("GCC"), "call_key"])
+    gcc_calls = calls_in_window[calls_in_window.call_key.isin(gcc_keys)].copy()
+    unmatched_calls = calls_in_window[~calls_in_window.call_key.isin(gcc_keys)].copy()
     c = st.columns(6)
     c[0].metric("Total calls", f"{int(joined.call_count.sum()):,}")
     c[1].metric("Unanswered calls", f"{int(joined.unanswered_calls.sum()):,}")
@@ -233,19 +263,19 @@ with tabs[3]:
     c[3].metric("Repeated unanswered", f"{int(joined.consecutive_unanswered_retries.sum()):,}")
     avg_speed = joined.speed_to_first_call_minutes.clip(lower=0).mean()
     c[4].metric("Avg speed to first call", f"{avg_speed:.0f} min" if pd.notna(avg_speed) else "N/A")
-    c[5].metric("Other-country calls", f"{len(other_calls):,}")
+    c[5].metric("Unmatched outbound calls", f"{len(unmatched_calls):,}")
     call_agent = gcc_calls.groupby("call_agent", dropna=False).agg(calls=("call_key", "size"), answered=("answered", "sum"), unique_leads=("call_key", "nunique"), talk_minutes=("duration_seconds", lambda x: x.sum()/60)).reset_index()
     call_agent["answer_rate"] = call_agent.answered.div(call_agent.calls).mul(100)
     st.dataframe(call_agent.sort_values("calls", ascending=False), hide_index=True, use_container_width=True)
     st.markdown("#### Leads requiring immediate follow-up")
     followup = joined[(~joined.called) | ((~joined.answered_any) & (~joined.converted))].sort_values(["called", "unanswered_calls"], ascending=[True, False])
     st.dataframe(followup[["lead_phone", "agent", "lead_time", "country", "product", "call_count", "unanswered_calls", "consecutive_unanswered_retries"]], hide_index=True, use_container_width=True)
-    st.markdown("#### Other-country outbound numbers — excluded from lead call matching")
-    if other_calls.empty:
-        st.success("No other-country outbound calls were found in this reporting window.")
+    st.markdown("#### Other-country DoubleTick leads — excluded from GCC call KPI")
+    other_lead_detail = joined[joined.lead_region.eq("Other country")][["lead_phone", "agent", "workpex_found", "converted"]]
+    if other_lead_detail.empty:
+        st.success("No other-country DoubleTick leads were found.")
     else:
-        other_summary = other_calls.groupby("call_number", dropna=False).agg(calls=("call_number", "size"), answered=("answered", "sum"), first_call=("call_time", "min"), last_call=("call_time", "max")).reset_index().sort_values("calls", ascending=False)
-        st.dataframe(other_summary, hide_index=True, use_container_width=True)
+        st.dataframe(other_lead_detail, hide_index=True, use_container_width=True)
 
 with tabs[4]:
     agents = grouped(joined, "agent")
