@@ -4,6 +4,7 @@ from datetime import date, time, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from urllib.parse import quote
 
 from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_leads, normalize_sales, qa_report
 from data_io import choose_best_sheet, detect_column, read_upload
@@ -33,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 7
+ANALYSIS_SCHEMA_VERSION = 8
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -42,6 +43,72 @@ if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
 def secret(name, default=""):
     try: return str(st.secrets.get(name, default))
     except Exception: return default
+
+
+SPEND_SHEET_ID = "1RSGCdB6UUFeFrX1mksMCBtElc9AijrKrlqR7tsP5fNg"
+SPEND_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPEND_SHEET_ID}/edit"
+SPEND_TABS = [
+    "Campaign - Ahamed Sijil Cv", "Campaign - emirath", "Campaign - Bsparq",
+    "Campaign - Emarath", "Campaign - Emarath-Qatar",
+    "Campaign - Emarath Global - KSA",
+]
+
+
+def campaign_key(value):
+    return pd.Series(value, dtype="string").fillna("").str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_google_campaign_spend(window_end_date):
+    frames = []
+    errors = []
+    for tab in SPEND_TABS:
+        csv_url = (
+            f"https://docs.google.com/spreadsheets/d/{SPEND_SHEET_ID}/gviz/tq"
+            f"?tqx=out:csv&sheet={quote(tab)}"
+        )
+        try:
+            frame = pd.read_csv(csv_url)
+            required = {"Window End Date (Dubai)", "Campaign Name", "Spend"}
+            if not required.issubset(frame.columns):
+                errors.append(f"{tab}: required spend columns missing")
+                continue
+            dates = pd.to_datetime(frame["Window End Date (Dubai)"], errors="coerce").dt.date
+            frame = frame.loc[dates.eq(window_end_date), ["Campaign Name", "Campaign ID", "Spend"]].copy()
+            if frame.empty:
+                continue
+            frame["Spend"] = pd.to_numeric(frame["Spend"], errors="coerce").fillna(0.0)
+            frame["Account"] = tab.removeprefix("Campaign - ")
+            frames.append(frame)
+        except Exception as exc:
+            errors.append(f"{tab}: {str(exc)[:120]}")
+    if not frames:
+        return pd.DataFrame(columns=["campaign_name_spend", "campaign_key", "spend", "spend_accounts"]), errors
+    raw = pd.concat(frames, ignore_index=True)
+    raw["campaign_key"] = campaign_key(raw["Campaign Name"])
+    grouped_spend = raw.groupby(["campaign_key", "Campaign Name"], as_index=False).agg(
+        spend=("Spend", "sum"),
+        spend_accounts=("Account", lambda values: ", ".join(sorted(set(values)))),
+    )
+    grouped_spend = grouped_spend.rename(columns={"Campaign Name": "campaign_name_spend"})
+    return grouped_spend, errors
+
+
+def campaign_performance(joined, spend_data):
+    performance = grouped(joined, "campaign_name")
+    performance["campaign_key"] = campaign_key(performance["campaign_name"])
+    performance = performance.merge(spend_data, on="campaign_key", how="outer")
+    performance["campaign_name"] = performance["campaign_name"].fillna(performance["campaign_name_spend"])
+    for column in ["leads", "orders", "revenue", "called_leads", "answered_leads"]:
+        if column not in performance:
+            performance[column] = 0
+        performance[column] = pd.to_numeric(performance[column], errors="coerce").fillna(0)
+    performance["spend"] = pd.to_numeric(performance.get("spend", 0), errors="coerce").fillna(0.0)
+    performance["cpl"] = performance["spend"].div(performance["leads"].replace(0, pd.NA))
+    performance["conversion_rate"] = performance["orders"].div(performance["leads"].replace(0, pd.NA)).mul(100)
+    performance["cost_per_order"] = performance["spend"].div(performance["orders"].replace(0, pd.NA))
+    performance["roas"] = performance["revenue"].div(performance["spend"].replace(0, pd.NA))
+    return performance.sort_values("spend", ascending=False)
 
 
 def mapping_ui(df, source):
@@ -187,9 +254,10 @@ if submitted:
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
     ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Workpex upload": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
-    st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report)
+    spend_data, spend_errors = load_google_campaign_spend(end_date)
+    st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors)
 elif "analysis_results" in st.session_state:
-    joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report = st.session_state["analysis_results"]
+    joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors = st.session_state["analysis_results"]
 else:
     st.stop()
 
@@ -238,12 +306,52 @@ with tabs[0]:
 
 with tabs[1]:
     missing_attr = joined[~joined.attribution_found].copy() if "attribution_found" in joined else joined.iloc[0:0]
-    if len(missing_attr): st.error(f"{len(missing_attr):,} DoubleTick assignments are missing from the Ad/Meta attribution report.")
-    view = st.radio("Break down by", ["country", "vendor", "product", "campaign_name"], horizontal=True)
-    market = grouped(joined, view)
-    st.dataframe(market, hide_index=True, use_container_width=True, column_config={"conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"), "call_coverage": st.column_config.NumberColumn("Call coverage %", format="%.1f%%")})
-    fig = px.bar(market.head(20), x=view, y="leads", color="conversion_rate", text="orders", title=f"Leads and orders by {view.replace('_',' ')}")
+    if len(missing_attr):
+        st.error(f"{len(missing_attr):,} DoubleTick assignments are missing from the Ad/Meta attribution report.")
+    if spend_errors:
+        st.warning("Some Google Sheet campaign tabs could not be read: " + " | ".join(spend_errors))
+    campaign_market = campaign_performance(joined, spend_data)
+    total_spend = float(campaign_market.spend.sum())
+    total_leads = int(joined.shape[0])
+    converted_leads = int(joined.converted.sum())
+    total_revenue = float(joined.order_value.sum())
+    k = st.columns(6)
+    k[0].metric("Meta spend", f"AED {total_spend:,.2f}")
+    k[1].metric("Attributed leads", f"{total_leads:,}")
+    k[2].metric("Cost per lead", f"AED {total_spend / total_leads:,.2f}" if total_leads else "N/A")
+    k[3].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
+    k[4].metric("Cost per order", f"AED {total_spend / converted_leads:,.2f}" if converted_leads else "N/A")
+    k[5].metric("Workpex revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
+    st.caption(f"Spend only: Google Sheet · Window ending {end_date.strftime('%d %b %Y')}. Leads: generated DoubleTick report. Orders and revenue: Workpex.")
+    st.markdown("#### Exact campaign performance")
+    campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "cost_per_order", "roas"]
+    st.dataframe(campaign_market[campaign_columns], hide_index=True, use_container_width=True, column_config={
+        "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
+        "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
+        "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
+        "conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"),
+        "cost_per_order": st.column_config.NumberColumn("Cost/order (AED)", format="%.2f"),
+        "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
+    })
+    chart_data = campaign_market[campaign_market.spend.gt(0)].head(20)
+    fig = px.bar(chart_data, x="campaign_name", y="spend", color="conversion_rate", text="orders", title="Campaign spend and converted orders", color_continuous_scale=["#dceff3","#16856b"])
+    fig.update_layout(xaxis_title="", yaxis_title="Spend (AED)", height=430)
     st.plotly_chart(fig, use_container_width=True)
+    view = st.radio("Operational breakdown", ["country", "vendor", "product"], horizontal=True)
+    market = grouped(joined, view)
+    campaign_dimensions = joined[["campaign_name", view]].drop_duplicates()
+    campaign_dimensions["campaign_key"] = campaign_key(campaign_dimensions["campaign_name"])
+    dimension_spend = spend_data.merge(campaign_dimensions[["campaign_key", view]], on="campaign_key", how="left").groupby(view, dropna=False).spend.sum().reset_index()
+    market = market.merge(dimension_spend, on=view, how="left")
+    market["spend"] = market["spend"].fillna(0.0)
+    market["cpl"] = market.spend.div(market.leads.replace(0, pd.NA))
+    market["cost_per_order"] = market.spend.div(market.orders.replace(0, pd.NA))
+    st.dataframe(market, hide_index=True, use_container_width=True, column_config={
+        "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
+        "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
+        "cost_per_order": st.column_config.NumberColumn("Cost/order (AED)", format="%.2f"),
+        "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
+    })
     st.markdown("#### Attribution/classification exceptions")
     country_values = joined["country"] if "country" in joined else pd.Series("Unmapped", index=joined.index)
     product_values = joined["product"] if "product" in joined else pd.Series("Unmapped", index=joined.index)
@@ -348,10 +456,10 @@ with tabs[5]:
     st.dataframe(unmapped, hide_index=True, use_container_width=True)
 
 agent_report = grouped(joined, "agent")
-marketing_report = grouped(joined, "campaign_name")
+marketing_report = campaign_performance(joined, spend_data)
 missing_workpex = joined[~joined.workpex_found].copy()
 missing_attribution = joined[~joined.attribution_found].copy() if "attribution_found" in joined else joined.iloc[0:0]
-download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Missing_From_Workpex": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing": marketing_report, "Orders": orders, "Calls": calls_in_window, "QA": qa})
+download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Missing_From_Workpex": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing_Performance": marketing_report, "Google_Sheet_Spend": spend_data, "Orders": orders, "Calls": calls_in_window, "QA": qa})
 window_name = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}"
 st.download_button("Download complete analysis (.xlsx)", download, file_name=f"sales_marketing_analysis_{window_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 
