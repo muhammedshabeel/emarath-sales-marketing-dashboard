@@ -34,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 9
+ANALYSIS_SCHEMA_VERSION = 10
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -209,12 +209,46 @@ if any(not selected[name][1].get("phone") for name in selected):
     st.error("A phone column is required for every source."); st.stop()
 
 dt_source, dt_mapping = selected["DoubleTick"]
-message_time_column = dt_mapping.get("datetime")
+selected_time_column = dt_mapping.get("datetime")
+
+
+def parse_doubletick_timestamps(series):
+    raw = series.astype("string").str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    parsed = pd.to_datetime(raw, errors="coerce", dayfirst=True, format="mixed")
+    numeric = pd.to_numeric(raw, errors="coerce")
+    # DoubleTick exports may contain Unix seconds/ms/us or Excel serial dates.
+    formats = [
+        (numeric.between(1e17, 1e19), "ns", None),
+        (numeric.between(1e14, 1e17), "us", None),
+        (numeric.between(1e11, 1e14), "ms", None),
+        (numeric.between(1e8, 1e11), "s", None),
+        (numeric.between(20000, 80000), "D", "1899-12-30"),
+    ]
+    for mask, unit, origin in formats:
+        fill_mask = parsed.isna() & mask.fillna(False)
+        if fill_mask.any():
+            values = pd.to_datetime(numeric[fill_mask], errors="coerce", unit=unit, origin=origin or "unix")
+            parsed.loc[fill_mask] = values
+    return parsed
+
+
+candidate_columns = []
+for column in [
+    selected_time_column, "Last message received at", "Last message received",
+    "Last CTWA lead at", "Last message sent at",
+]:
+    if column and column in dt_source.columns and column not in candidate_columns:
+        candidate_columns.append(column)
+best_count, message_time_column, message_times = 0, None, None
+for column in candidate_columns:
+    candidate_times = parse_doubletick_timestamps(dt_source[column])
+    valid_count = int(candidate_times.notna().sum())
+    if valid_count > best_count:
+        best_count, message_time_column, message_times = valid_count, column, candidate_times
 if not message_time_column:
-    st.error("Select the DoubleTick Last message received column to detect the reporting period."); st.stop()
-message_times = pd.to_datetime(dt_source[message_time_column], errors="coerce", dayfirst=True, format="mixed")
-if message_times.notna().sum() == 0:
-    st.error(f"No valid timestamps were found in DoubleTick column: {message_time_column}."); st.stop()
+    st.error("No valid DoubleTick last-activity timestamps were found. Select a populated Last message/Last CTWA column."); st.stop()
+if selected_time_column and message_time_column != selected_time_column:
+    st.warning(f"{selected_time_column} is empty or invalid. Reporting period detected from {message_time_column} ({best_count:,} valid timestamps).")
 if getattr(message_times.dt, "tz", None) is None:
     message_times = message_times.dt.tz_localize(dt_tz, ambiguous="NaT", nonexistent="shift_forward")
 else:
