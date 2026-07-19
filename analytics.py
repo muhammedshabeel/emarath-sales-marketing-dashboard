@@ -165,6 +165,8 @@ def grouped(joined, field):
     out["conversion_rate"] = out.orders.div(out.leads).mul(100)
     out["call_coverage"] = out.called_leads.div(out.leads).mul(100)
     out["answer_rate"] = out.answered_leads.div(out.called_leads.replace(0, pd.NA)).mul(100)
+    for col in ("conversion_rate", "call_coverage", "answer_rate"):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).astype(float)
     return out.sort_values("leads", ascending=False)
 
 
