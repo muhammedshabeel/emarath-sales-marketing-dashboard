@@ -7,7 +7,7 @@ import streamlit as st
 
 from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_leads, normalize_sales, qa_report
 from data_io import choose_best_sheet, detect_column, read_upload
-from enrichment import enrich_doubletick, enrich_meta
+from enrichment import generate_fixed_zip_report
 
 st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="wide")
 
@@ -152,7 +152,7 @@ if any(not selected[name][1].get("phone") for name in selected):
 st.subheader("3. Integrated fixed ZIP attribution engine")
 api_key = secret("DOUBLETICK_API_KEY")
 meta_token = secret("META_ACCESS_TOKEN")
-st.caption("Only customer numbers are sent from the DoubleTick assignment upload into the integrated doubletick_ad_id_meta_campaign_fixed engine. Campaign, country, product and vendor come from its generated report and the uploaded product/vendor reference.")
+st.caption("Every build replaces the integrated ZIP engine's phone list with the current DoubleTick all-customer Phone number column. Marketing is then calculated only from the newly generated DoubleTick Ad/Meta report and the product/vendor reference.")
 submitted = st.button("Build dashboard", type="primary", use_container_width=True)
 
 if submitted:
@@ -165,15 +165,12 @@ if submitted:
     if not api_key or not meta_token:
         st.error("DOUBLETICK_API_KEY and META_ACCESS_TOKEN are both required in Streamlit App settings → Secrets."); st.stop()
     bar = st.progress(0, text="Fetching DoubleTick chats…")
-    dt_report = enrich_doubletick(leads.lead_phone.str.replace(r"\D", "", regex=True), api_key, wabas, start_date, end_date, progress=lambda x: bar.progress(x, text="Fetching DoubleTick chats…"))
-    bar.progress(0, text="Resolving Ad IDs through Meta…")
-    meta = enrich_meta(dt_report.ad_id, meta_token, progress=lambda x: bar.progress(x, text="Resolving Ad IDs through Meta…"))
-    dt_report["ad_id_join"] = dt_report.ad_id.astype(str)
-    dt_report = dt_report.merge(meta, on="ad_id_join", how="left").drop(columns="ad_id_join")
-    meta_cols = ["meta_ad_name", "meta_adset_id", "meta_adset_name", "meta_campaign_id", "meta_campaign_name", "meta_lookup_status", "meta_error"]
-    dt_report.loc[dt_report.ad_id.eq(""), meta_cols] = dt_report.loc[dt_report.ad_id.eq(""), meta_cols].fillna({"meta_lookup_status": "NOT_LOOKED_UP"})
-    dt_report[meta_cols] = dt_report[meta_cols].fillna("")
-    attribution = normalize_attribution(dt_report, {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status"})
+    dt_report = generate_fixed_zip_report(
+        leads.lead_phone, api_key, meta_token, wabas, start_date, end_date,
+        doubletick_progress=lambda x: bar.progress(x, text="Generating report from the replaced DoubleTick phone list…"),
+        meta_progress=lambda x: bar.progress(x, text="Resolving generated Ad IDs through Meta…"),
+    )
+    attribution = normalize_attribution(dt_report, {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status", "classification": "classification_text"})
     leads = attach_attribution(leads, attribution)
     bar.empty()
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
@@ -291,7 +288,10 @@ with tabs[5]:
     st.markdown("#### Authoritative DoubleTick agent directory")
     st.caption("Transcribed from the supplied DoubleTick member screenshots. Unknown agent numbers remain visibly unmapped.")
     st.dataframe(agent_crosswalk, hide_index=True, use_container_width=True)
-    unmapped = joined[joined.country.eq("Unmapped") | joined.product.eq("Unmapped")][["campaign_name", "ad_id", "lead_phone"]].drop_duplicates()
+    country_values = joined["country"] if "country" in joined else pd.Series("Unmapped", index=joined.index)
+    product_values = joined["product"] if "product" in joined else pd.Series("Unmapped", index=joined.index)
+    unmapped_columns = [column for column in ["campaign_name", "ad_id", "lead_phone", "attribution_status"] if column in joined.columns]
+    unmapped = joined.loc[country_values.eq("Unmapped") | product_values.eq("Unmapped"), unmapped_columns].drop_duplicates()
     st.markdown("#### Unmapped campaign names")
     st.dataframe(unmapped, hide_index=True, use_container_width=True)
 
