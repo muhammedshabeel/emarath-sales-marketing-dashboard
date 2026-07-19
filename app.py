@@ -133,10 +133,10 @@ for tab, name, frames in zip(tabs, ["DoubleTick", "Workpex", "3CX"], [dt_frames,
 if any(not selected[name][1].get("phone") for name in selected):
     st.error("A phone column is required for every source."); st.stop()
 
-st.subheader("3. Automated DoubleTick → Meta enrichment")
+st.subheader("3. Integrated fixed ZIP attribution engine")
 api_key = secret("DOUBLETICK_API_KEY")
 meta_token = secret("META_ACCESS_TOKEN")
-st.caption("Build runs the uploaded assignment numbers through DoubleTick, resolves every available Ad ID through Meta, and creates the same four-sheet attribution workbook automatically.")
+st.caption("Only customer numbers are sent from the DoubleTick assignment upload into the integrated doubletick_ad_id_meta_campaign_fixed engine. Campaign, country, product and vendor come from its generated report and the uploaded product/vendor reference.")
 submitted = st.button("Build dashboard", type="primary", use_container_width=True)
 
 if submitted:
@@ -204,6 +204,13 @@ with tabs[1]:
     st.dataframe(market, hide_index=True, use_container_width=True, column_config={"conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"), "call_coverage": st.column_config.NumberColumn("Call coverage %", format="%.1f%%")})
     fig = px.bar(market.head(20), x=view, y="leads", color="conversion_rate", text="orders", title=f"Leads and orders by {view.replace('_',' ')}")
     st.plotly_chart(fig, use_container_width=True)
+    st.markdown("#### Attribution/classification exceptions")
+    exceptions = joined[joined.country.eq("Unmapped") | joined.product.eq("Unmapped")][["lead_phone", "ad_id", "campaign_name", "attribution_status", "country", "product", "vendor"]].copy()
+    if exceptions.empty:
+        st.success("Every generated campaign was classified.")
+    else:
+        st.warning(f"{len(exceptions):,} leads could not be fully classified. The campaign name and attribution status below show the exact reason.")
+        st.dataframe(exceptions, hide_index=True, use_container_width=True)
 
 with tabs[2]:
     missing_wp = joined[~joined.workpex_found].copy()
