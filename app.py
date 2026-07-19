@@ -33,7 +33,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 5
+ANALYSIS_SCHEMA_VERSION = 6
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -46,13 +46,13 @@ def secret(name, default=""):
 
 def mapping_ui(df, source):
     roles = {
-        "DoubleTick": ["phone", "agent_number"],
+        "DoubleTick": ["phone", "agent_number", "datetime"],
         "Attribution": ["phone", "ad_id", "campaign", "status"],
         "Workpex": ["phone", "datetime", "agent", "order_id", "status", "product", "amount"],
         "3CX": ["phone", "datetime", "agent", "call_status", "duration", "direction"],
     }[source]
     exact_defaults = {
-        "DoubleTick": {"phone": "Phone number", "agent_number": "Agent Phone Number"},
+        "DoubleTick": {"phone": "Phone number", "agent_number": "Agent Phone Number", "datetime": "Last message received at"},
         "Attribution": {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status"},
         "Workpex": {"phone": "Primary Phone", "datetime": "Created Date", "agent": "Assigned", "status": "Lead Status", "product": "Product", "amount": "Actual Amount"},
         "3CX": {"phone": "To", "datetime": "Call Time", "agent": "From", "call_status": "Status", "duration": "Talking", "direction": "Direction"},
@@ -63,6 +63,11 @@ def mapping_ui(df, source):
     cols = st.columns(3)
     for i, role in enumerate(roles):
         preferred = exact_defaults.get(source, {}).get(role)
+        if source == "DoubleTick" and role == "datetime":
+            # Exports may label the same event differently. Prefer the user's
+            # Last message received field, then DoubleTick's CTWA equivalent.
+            candidates = ["Last message received at", "Last message received", "Last CTWA lead at"]
+            preferred = next((column for column in candidates if column in df.columns), preferred)
         detected = preferred if preferred in df.columns else detect_column(df.columns, role)
         index = options.index(detected) if detected in options else 0
         label = role.replace("_", " ").title() + (" *" if role in required else "")
@@ -91,44 +96,15 @@ def excel_bytes(tables):
 
 with st.sidebar:
     st.header("Report controls")
-    today = date.today()
-    # Default to the latest completed 5 PM-to-5 PM reporting period. For
-    # example, on 19 July this is 17 July 5 PM through 18 July 5 PM.
-    start_date = st.date_input("DoubleTick attribution start date", today - timedelta(days=2))
-    end_date = st.date_input("DoubleTick attribution end date (inclusive)", today - timedelta(days=1))
     report_tz = st.selectbox("Report timezone", ["Asia/Dubai", "Asia/Kolkata"], format_func=lambda x: "GCC — Dubai (UTC+4)" if x == "Asia/Dubai" else "India — IST (UTC+5:30)")
     streak_gap = st.slider("Consecutive retry gap (minutes)", 1, 60, 15)
-    st.divider()
-    st.subheader("3CX analysis scope")
-    call_scope = st.radio("Calls to analyse", ["Custom date/time window", "Use all uploaded outbound calls"], index=0, help="Custom is the KPI reporting period. Use all uploaded calls only when the 3CX export itself is already trimmed to the exact period.")
-    filter_calls = call_scope == "Custom date/time window"
-    if filter_calls:
-        call_start_date = st.date_input("3CX start date", start_date)
-        call_start_time = st.time_input("3CX start time", time(17, 0), step=timedelta(minutes=15))
-        call_end_date = st.date_input("3CX end date", end_date)
-        call_end_time = st.time_input("3CX end time", time(17, 0), step=timedelta(minutes=15))
-        call_start = pd.Timestamp.combine(call_start_date, call_start_time).tz_localize(report_tz)
-        call_end = pd.Timestamp.combine(call_end_date, call_end_time).tz_localize(report_tz)
-    else:
-        call_start = pd.Timestamp(start_date).tz_localize(report_tz)
-        call_end = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).tz_localize(report_tz)
+    st.caption("The attribution and 3CX reporting window is detected automatically from the uploaded DoubleTick Last message received column.")
     st.divider()
     st.subheader("Source timezones")
     tz_options = ["Asia/Dubai", "Asia/Kolkata"]
     dt_tz = st.selectbox("DoubleTick", tz_options, 0, help="Used for lead-time and speed-to-call only. It never removes rows from the DoubleTick upload.")
     wp_tz = st.selectbox("Workpex", tz_options, 0)
     cx_tz = st.selectbox("3CX", tz_options, 0)
-
-if start_date > end_date:
-    st.error("Start date must not be after end date."); st.stop()
-if filter_calls and call_start >= call_end:
-    st.error("3CX analysis start must be before its end."); st.stop()
-
-st.info(
-    f"Attribution API dates: {start_date.strftime('%d/%m/%Y')} → {end_date.strftime('%d/%m/%Y')} inclusive. "
-    "DoubleTick and Workpex uploads are authoritative. "
-    + (f"3CX custom window: {call_start.strftime('%d/%m/%Y %I:%M %p')} → {call_end.strftime('%d/%m/%Y %I:%M %p')} ({report_tz})." if filter_calls else "Every uploaded outbound 3CX row will be analysed.")
-)
 
 st.subheader("1. Upload the three source reports")
 c1, c2, c3 = st.columns(3)
@@ -161,6 +137,28 @@ for tab, name, frames in zip(tabs, ["DoubleTick", "Workpex", "3CX"], [dt_frames,
 
 if any(not selected[name][1].get("phone") for name in selected):
     st.error("A phone column is required for every source."); st.stop()
+
+dt_source, dt_mapping = selected["DoubleTick"]
+message_time_column = dt_mapping.get("datetime")
+if not message_time_column:
+    st.error("Select the DoubleTick Last message received column to detect the reporting period."); st.stop()
+message_times = pd.to_datetime(dt_source[message_time_column], errors="coerce", dayfirst=True, format="mixed")
+if message_times.notna().sum() == 0:
+    st.error(f"No valid timestamps were found in DoubleTick column: {message_time_column}."); st.stop()
+if getattr(message_times.dt, "tz", None) is None:
+    message_times = message_times.dt.tz_localize(dt_tz, ambiguous="NaT", nonexistent="shift_forward")
+else:
+    message_times = message_times.dt.tz_convert(dt_tz)
+report_start = message_times.min().tz_convert(report_tz)
+report_end = message_times.max().tz_convert(report_tz)
+start_date, end_date = report_start.date(), report_end.date()
+call_start, call_end = report_start, report_end + pd.Timedelta(microseconds=1)
+filter_calls = True
+st.info(
+    f"Detected from DoubleTick {message_time_column}: "
+    f"{report_start.strftime('%d/%m/%Y %I:%M %p')} → {report_end.strftime('%d/%m/%Y %I:%M %p')} "
+    f"({report_tz}). This detected range drives attribution and 3CX analysis."
+)
 
 st.subheader("3. Integrated fixed ZIP attribution engine")
 api_key = secret("DOUBLETICK_API_KEY")
