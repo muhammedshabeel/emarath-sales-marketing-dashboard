@@ -33,7 +33,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 6
+ANALYSIS_SCHEMA_VERSION = 7
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -259,7 +259,10 @@ with tabs[1]:
 with tabs[2]:
     missing_wp = joined[~joined.workpex_found].copy()
     multiple_wp = joined[joined.workpex_match_count.gt(1)].copy()
-    st.error(f"{len(missing_wp):,} DoubleTick leads are missing from Workpex in the selected reporting window.") if len(missing_wp) else st.success("Every DoubleTick lead appears in Workpex.")
+    if len(missing_wp):
+        st.error(f"{len(missing_wp):,} DoubleTick leads are missing from Workpex in the detected reporting period.")
+    else:
+        st.success("Every DoubleTick lead appears in Workpex.")
     st.markdown("#### DoubleTick → Workpex reconciliation")
     reconciliation = joined.workpex_reconciliation.value_counts().rename_axis("result").reset_index(name="leads")
     st.dataframe(reconciliation, hide_index=True, use_container_width=True)
