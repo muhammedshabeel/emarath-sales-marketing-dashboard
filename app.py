@@ -1,6 +1,6 @@
 from __future__ import annotations
 import io
-from datetime import date, time, timedelta
+from datetime import date, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -76,10 +76,8 @@ def excel_bytes(tables):
 with st.sidebar:
     st.header("Report controls")
     today = date.today()
-    start_date = st.date_input("Report start date", today - timedelta(days=1))
-    start_time = st.time_input("Report start time", time(17, 0), step=timedelta(minutes=15))
-    end_date = st.date_input("Report end date", today)
-    end_time = st.time_input("Report end time", time(17, 0), step=timedelta(minutes=15))
+    start_date = st.date_input("DoubleTick attribution start date", today - timedelta(days=1))
+    end_date = st.date_input("DoubleTick attribution end date (inclusive)", today)
     report_tz = st.selectbox("Report timezone", ["Asia/Dubai", "Asia/Kolkata"], format_func=lambda x: "GCC — Dubai (UTC+4)" if x == "Asia/Dubai" else "India — IST (UTC+5:30)")
     streak_gap = st.slider("Consecutive retry gap (minutes)", 1, 60, 15)
     st.divider()
@@ -89,16 +87,13 @@ with st.sidebar:
     wp_tz = st.selectbox("Workpex", tz_options, 0)
     cx_tz = st.selectbox("3CX", tz_options, 0)
 
-start_at = pd.Timestamp.combine(start_date, start_time).tz_localize(report_tz)
-end_at = pd.Timestamp.combine(end_date, end_time).tz_localize(report_tz)
-if start_at >= end_at:
-    st.error("Report start must be before report end."); st.stop()
+if start_date > end_date:
+    st.error("Start date must not be after end date."); st.stop()
 
 st.info(
-    f"Reporting window: {start_at.strftime('%d/%m/%Y %I:%M %p')} → "
-    f"{end_at.strftime('%d/%m/%Y %I:%M %p')} ({report_tz}). "
-    "DoubleTick assignments and Workpex rows are treated as prefiltered, authoritative uploads; "
-    "the exact window is applied to outbound 3CX calls."
+    f"Attribution API dates: {start_date.strftime('%d/%m/%Y')} → {end_date.strftime('%d/%m/%Y')} inclusive. "
+    "The uploaded DoubleTick, Workpex and 3CX reports are treated as prefiltered, authoritative datasets. "
+    "The dashboard analyzes every uploaded row without imposing a fixed reporting-time window."
 )
 
 st.subheader("1. Upload the three source reports")
@@ -160,8 +155,8 @@ if submitted:
     attribution = normalize_attribution(dt_report, {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status"})
     leads = attach_attribution(leads, attribution)
     bar.empty()
-    joined, orders, calls_in_window = build_analysis(leads, sales, calls, start_at, end_at, report_tz, streak_gap)
-    ranges = {"Selected reporting window": (start_at, end_at), "Workpex upload": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
+    joined, orders, calls_in_window = build_analysis(leads, sales, calls, start_date, end_date, report_tz, streak_gap)
+    ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Workpex upload": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
     st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report)
 elif "analysis_results" in st.session_state:
@@ -275,7 +270,7 @@ marketing_report = grouped(joined, "campaign_name")
 missing_workpex = joined[~joined.workpex_found].copy()
 missing_attribution = joined[~joined.attribution_found].copy() if "attribution_found" in joined else joined.iloc[0:0]
 download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Missing_From_Workpex": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing": marketing_report, "Orders": orders, "Calls": calls_in_window, "QA": qa})
-window_name = f"{start_at.strftime('%Y-%m-%d_%H%M')}_{end_at.strftime('%Y-%m-%d_%H%M')}"
+window_name = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}"
 st.download_button("Download complete analysis (.xlsx)", download, file_name=f"sales_marketing_analysis_{window_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 
 attribution_download = excel_bytes({"All_Chats": dt_report, "Ad_ID_Found": dt_report[dt_report.ad_id.ne("")], "Ad_ID_Missing": dt_report[dt_report.ad_id.eq("")], "Summary": dt_report.groupby("status").size().rename("count").reset_index()})
