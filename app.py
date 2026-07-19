@@ -34,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 8
+ANALYSIS_SCHEMA_VERSION = 9
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -95,7 +95,10 @@ def load_google_campaign_spend(window_end_date):
 
 
 def campaign_performance(joined, spend_data):
-    performance = grouped(joined, "campaign_name")
+    # Marketing performance is limited to leads attributed by the generated
+    # ZIP/Meta report. Blank/unattributed DoubleTick rows are not marketing leads.
+    attributed = joined[joined["campaign_name"].fillna("").astype(str).str.strip().ne("")].copy()
+    performance = grouped(attributed, "campaign_name")
     performance["campaign_key"] = campaign_key(performance["campaign_name"])
     performance = performance.merge(spend_data, on="campaign_key", how="outer")
     performance["campaign_name"] = performance["campaign_name"].fillna(performance["campaign_name_spend"])
@@ -312,9 +315,10 @@ with tabs[1]:
         st.warning("Some Google Sheet campaign tabs could not be read: " + " | ".join(spend_errors))
     campaign_market = campaign_performance(joined, spend_data)
     total_spend = float(campaign_market.spend.sum())
-    total_leads = int(joined.shape[0])
-    converted_leads = int(joined.converted.sum())
-    total_revenue = float(joined.order_value.sum())
+    marketing_joined = joined[joined["campaign_name"].fillna("").astype(str).str.strip().ne("")]
+    total_leads = int(marketing_joined.shape[0])
+    converted_leads = int(marketing_joined.converted.sum())
+    total_revenue = float(marketing_joined.order_value.sum())
     k = st.columns(6)
     k[0].metric("Meta spend", f"AED {total_spend:,.2f}")
     k[1].metric("Attributed leads", f"{total_leads:,}")
