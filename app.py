@@ -13,9 +13,20 @@ st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="
 
 st.markdown("""
 <style>
-.block-container{padding-top:1.4rem;max-width:1500px}.metric-card{background:white;border:1px solid #e8e7df;border-radius:14px;padding:14px}
-h1,h2,h3{letter-spacing:-.03em}.stMetric{background:#fff;border:1px solid #e9e7df;padding:14px;border-radius:12px}
-[data-testid="stSidebar"]{border-right:1px solid #e4e1d7}
+.stApp{background:linear-gradient(180deg,#f7f9fc 0,#fff 340px)}
+.block-container{padding-top:1.25rem;max-width:1480px}h1,h2,h3{letter-spacing:-.035em;color:#132238}
+[data-testid="stSidebar"]{background:#fff;border-right:1px solid #e6eaf0}
+[data-testid="stMetric"]{background:#fff;border:1px solid #e6eaf0;padding:18px;border-radius:18px;box-shadow:0 7px 24px rgba(23,42,79,.055)}
+[data-testid="stMetricLabel"]{color:#667085;font-weight:650}[data-testid="stMetricValue"]{color:#132238;font-weight:750}
+.hero{padding:26px 30px;border-radius:24px;background:linear-gradient(120deg,#102a43,#176b87);color:white;margin:.4rem 0 1.2rem;box-shadow:0 16px 40px rgba(16,42,67,.18)}
+.hero h2{color:white;margin:0 0 7px}.hero p{margin:0;color:#d9edf4}
+.section-label{font-size:.75rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#d4a017;margin:1.4rem 0 .5rem}
+.agent-card{background:#fff;border:1px solid #e6eaf0;border-radius:20px;padding:20px;box-shadow:0 8px 24px rgba(23,42,79,.05);min-height:164px}
+.agent-name{font-size:1.1rem;font-weight:800;color:#132238}.agent-sub{color:#667085;font-size:.82rem;margin-bottom:14px}
+.agent-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.agent-kpi{background:#f7f9fc;border-radius:12px;padding:10px}
+.agent-kpi b{display:block;font-size:1.35rem;color:#132238}.agent-kpi span{font-size:.72rem;color:#667085}
+.good{color:#16856b}.risk{color:#d04a42}
+.stTabs [data-baseweb="tab-list"]{gap:8px;background:#eef2f6;padding:6px;border-radius:14px}.stTabs [data-baseweb="tab"]{border-radius:10px;padding:9px 17px}
 </style>
 """, unsafe_allow_html=True)
 
@@ -190,29 +201,41 @@ if joined.empty:
 if len({dt_tz, wp_tz, cx_tz}) > 1:
     st.warning("Source timezones differ. Times were converted to the selected report timezone; verify those source timezone selections.")
 
-tabs = st.tabs(["Executive", "Marketing", "Sales", "3CX calls", "Agent performance", "Data quality"])
+st.markdown(f"""<div class="hero"><h2>Performance command centre</h2><p>{len(joined):,} assigned leads · {pd.Timestamp(call_start).strftime('%d %b, %I:%M %p')} to {pd.Timestamp(call_end).strftime('%d %b, %I:%M %p')} · Dubai time</p></div>""", unsafe_allow_html=True)
+tabs = st.tabs(["Overview", "Marketing", "Sales", "3CX calls", "Agent scorecards", "Data quality"])
 
 with tabs[0]:
     total_leads, total_orders = len(joined), int(joined.order_count.sum())
     gcc_leads = joined[joined.lead_region.eq("GCC")]
     other_leads = joined[joined.lead_region.eq("Other country")]
-    metrics = st.columns(8)
+    st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
+    metrics = st.columns(4)
     metrics[0].metric("Leads", f"{total_leads:,}")
     metrics[1].metric("Orders", f"{total_orders:,}")
     metrics[2].metric("Conversion", f"{total_orders / total_leads * 100:.1f}%")
-    metrics[3].metric("GCC leads", f"{len(gcc_leads):,}")
-    metrics[4].metric("Never called — GCC", f"{(~gcc_leads.called).sum():,}")
-    metrics[5].metric("Answered GCC leads", f"{gcc_leads.answered_any.sum():,}")
-    metrics[6].metric("Other-country leads", f"{len(other_leads):,}")
-    metrics[7].metric("Missing in Workpex", f"{(~joined.workpex_found).sum():,}")
-    daily = grouped(joined, "lead_date")
-    daily["lead_date"] = daily["lead_date"].astype(str)
-    fig = px.bar(daily, x="lead_date", y=["leads", "orders", "called_leads"], barmode="group", title="Reporting-period funnel")
-    st.plotly_chart(fig, use_container_width=True)
+    metrics[3].metric("Workpex matched", f"{joined.workpex_found.sum():,}", f"{joined.workpex_found.mean()*100:.1f}% coverage")
+    st.markdown('<div class="section-label">Call execution · GCC leads only</div>', unsafe_allow_html=True)
+    call_metrics = st.columns(4)
+    call_metrics[0].metric("GCC assigned", f"{len(gcc_leads):,}")
+    call_metrics[1].metric("Called", f"{gcc_leads.called.sum():,}", f"{gcc_leads.called.mean()*100:.1f}% coverage")
+    call_metrics[2].metric("Answered", f"{gcc_leads.answered_any.sum():,}", f"{gcc_leads.answered_any.mean()*100:.1f}% of GCC leads")
+    call_metrics[3].metric("Never called", f"{(~gcc_leads.called).sum():,}", f"{(~gcc_leads.called).mean()*100:.1f}% requires action", delta_color="inverse")
+    funnel = pd.DataFrame({"stage":["Assigned leads","GCC leads","Called GCC leads","Answered GCC leads","Converted leads"],"leads":[len(joined),len(gcc_leads),int(gcc_leads.called.sum()),int(gcc_leads.answered_any.sum()),int(joined.converted.sum())]})
+    left, right = st.columns([1.45, 1])
+    with left:
+        fig = px.funnel(funnel, x="leads", y="stage", title="Lead-to-order journey", color="stage", color_discrete_sequence=["#176b87","#2389a8","#42a5b8","#7bc5ca","#d4a017"])
+        fig.update_layout(showlegend=False, margin=dict(l=15,r=15,t=55,b=15), height=390)
+        st.plotly_chart(fig, use_container_width=True)
+    with right:
+        disposition = pd.DataFrame({"status":["Answered","Called, no answer","Never called"],"leads":[int(gcc_leads.answered_any.sum()),int((gcc_leads.called & ~gcc_leads.answered_any).sum()),int((~gcc_leads.called).sum())]})
+        fig = px.pie(disposition, names="status", values="leads", hole=.68, title="GCC call disposition", color="status", color_discrete_map={"Answered":"#16856b","Called, no answer":"#f0b44d","Never called":"#d04a42"})
+        fig.update_layout(margin=dict(l=10,r=10,t=55,b=10),height=390,legend_orientation="h")
+        st.plotly_chart(fig, use_container_width=True)
     failures = pd.DataFrame({
         "failure point": ["No call made", "Called but never answered", "Answered but no order", "Campaign not classified"],
         "leads": [(~gcc_leads.called).sum(), (gcc_leads.called & ~gcc_leads.answered_any).sum(), (gcc_leads.answered_any & ~gcc_leads.converted).sum(), joined.country.eq("Unmapped").sum()],
     }).sort_values("leads", ascending=False)
+    failures.columns = ["Action needed", "Leads"]
     st.dataframe(failures, hide_index=True, use_container_width=True)
 
 with tabs[1]:
@@ -279,9 +302,34 @@ with tabs[3]:
 
 with tabs[4]:
     agents = grouped(joined, "agent")
+    agents = agents.sort_values(["orders","conversion_rate"], ascending=False)
+    agent_cards = []
+    for agent_name, agent_rows in joined.groupby("agent", dropna=False):
+        agent_gcc = agent_rows[agent_rows.lead_region.eq("GCC")]
+        assigned = len(agent_rows)
+        converted = int(agent_rows.converted.sum())
+        agent_cards.append({"agent": agent_name, "assigned": assigned, "converted": converted,
+                            "conversion": converted / assigned * 100 if assigned else 0,
+                            "answered": int(agent_gcc.answered_any.sum()),
+                            "not_dialed": int((~agent_gcc.called).sum()),
+                            "coverage": agent_gcc.called.mean() * 100 if len(agent_gcc) else 0})
+    agent_cards = pd.DataFrame(agent_cards).sort_values(["converted", "conversion"], ascending=False)
+    st.markdown('<div class="section-label">Team leaderboard</div>', unsafe_allow_html=True)
+    leaderboard = px.bar(agent_cards, x="agent", y="converted", color="conversion", text="converted", title="Converted leads by assigned agent", color_continuous_scale=["#dceff3","#16856b"])
+    leaderboard.update_layout(xaxis_title="",yaxis_title="Converted leads",height=390,margin=dict(l=15,r=15,t=55,b=15))
+    st.plotly_chart(leaderboard, use_container_width=True)
+    st.markdown('<div class="section-label">Individual agent cards</div>', unsafe_allow_html=True)
+    card_columns = st.columns(3)
+    for position, row in enumerate(agent_cards.itertuples(index=False)):
+        agent_rows = joined[joined.agent.eq(row.agent)]
+        with card_columns[position % 3]:
+            st.markdown(f'''<div class="agent-card"><div class="agent-name">👤 {row.agent}</div><div class="agent-sub">Assigned lead owner</div><div class="agent-grid"><div class="agent-kpi"><b>{row.assigned:,}</b><span>Assigned leads</span></div><div class="agent-kpi"><b class="good">{row.converted:,}</b><span>Converted · {row.conversion:.1f}%</span></div><div class="agent-kpi"><b>{row.answered:,}</b><span>Answered GCC</span></div><div class="agent-kpi"><b class="risk">{row.not_dialed:,}</b><span>Not dialed GCC</span></div></div></div>''', unsafe_allow_html=True)
+            st.progress(min(max(row.coverage / 100, 0), 1), text=f"Call coverage {row.coverage:.1f}%")
+            with st.expander("View assigned lead details"):
+                detail_cols = [column for column in ["lead_phone","country","product","called","answered_any","converted","order_count"] if column in agent_rows]
+                st.dataframe(agent_rows[detail_cols], hide_index=True, use_container_width=True)
+    st.markdown('<div class="section-label">Full team comparison</div>', unsafe_allow_html=True)
     st.dataframe(agents, hide_index=True, use_container_width=True, column_config={"conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"), "call_coverage": st.column_config.ProgressColumn("Call coverage %", min_value=0, max_value=100, format="%.1f%%")})
-    fig = px.scatter(agents, x="call_coverage", y="conversion_rate", size="leads", color="answer_rate", hover_name="agent", title="Agent execution: call coverage vs conversion")
-    st.plotly_chart(fig, use_container_width=True)
 
 with tabs[5]:
     st.markdown("#### Detected source ranges")
