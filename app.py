@@ -222,19 +222,28 @@ with tabs[2]:
     st.dataframe(orders.sort_values("sale_time", ascending=False), hide_index=True, use_container_width=True)
 
 with tabs[3]:
-    c = st.columns(5)
+    gcc_calls = calls_in_window[calls_in_window.call_region.eq("GCC")].copy()
+    other_calls = calls_in_window[calls_in_window.call_region.eq("Other country")].copy()
+    c = st.columns(6)
     c[0].metric("Total calls", f"{int(joined.call_count.sum()):,}")
     c[1].metric("Unanswered calls", f"{int(joined.unanswered_calls.sum()):,}")
     c[2].metric("Never-called leads", f"{(~joined.called).sum():,}")
     c[3].metric("Repeated unanswered", f"{int(joined.consecutive_unanswered_retries.sum()):,}")
     avg_speed = joined.speed_to_first_call_minutes.clip(lower=0).mean()
     c[4].metric("Avg speed to first call", f"{avg_speed:.0f} min" if pd.notna(avg_speed) else "N/A")
-    call_agent = calls_in_window.groupby("call_agent", dropna=False).agg(calls=("phone_key", "size"), answered=("answered", "sum"), unique_leads=("phone_key", "nunique"), talk_minutes=("duration_seconds", lambda x: x.sum()/60)).reset_index()
+    c[5].metric("Other-country calls", f"{len(other_calls):,}")
+    call_agent = gcc_calls.groupby("call_agent", dropna=False).agg(calls=("call_key", "size"), answered=("answered", "sum"), unique_leads=("call_key", "nunique"), talk_minutes=("duration_seconds", lambda x: x.sum()/60)).reset_index()
     call_agent["answer_rate"] = call_agent.answered.div(call_agent.calls).mul(100)
     st.dataframe(call_agent.sort_values("calls", ascending=False), hide_index=True, use_container_width=True)
     st.markdown("#### Leads requiring immediate follow-up")
     followup = joined[(~joined.called) | ((~joined.answered_any) & (~joined.converted))].sort_values(["called", "unanswered_calls"], ascending=[True, False])
     st.dataframe(followup[["lead_phone", "agent", "lead_time", "country", "product", "call_count", "unanswered_calls", "consecutive_unanswered_retries"]], hide_index=True, use_container_width=True)
+    st.markdown("#### Other-country outbound numbers — excluded from lead call matching")
+    if other_calls.empty:
+        st.success("No other-country outbound calls were found in this reporting window.")
+    else:
+        other_summary = other_calls.groupby("call_number", dropna=False).agg(calls=("call_number", "size"), answered=("answered", "sum"), first_call=("call_time", "min"), last_call=("call_time", "max")).reset_index().sort_values("calls", ascending=False)
+        st.dataframe(other_summary, hide_index=True, use_container_width=True)
 
 with tabs[4]:
     agents = grouped(joined, "agent")
