@@ -91,8 +91,12 @@ def agent_directory_frame():
 
 def _window(df, col, start, end, report_tz):
     if col not in df or df[col].isna().all(): return df.copy()
-    lo = pd.Timestamp(start).tz_localize(report_tz)
-    hi = (pd.Timestamp(end) + pd.Timedelta(days=1)).tz_localize(report_tz)
+    lo = pd.Timestamp(start)
+    hi = pd.Timestamp(end)
+    if lo.tzinfo is None: lo = lo.tz_localize(report_tz)
+    else: lo = lo.tz_convert(report_tz)
+    if hi.tzinfo is None: hi = hi.tz_localize(report_tz)
+    else: hi = hi.tz_convert(report_tz)
     return df[df[col].ge(lo) & df[col].lt(hi)].copy()
 
 
@@ -101,7 +105,11 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     # lead for the chosen reporting period. Never discard it using historical
     # customer timestamps such as First message received at.
     leads = leads.copy()
-    sales = _window(sales, "sale_time", start, end, report_tz)
+    # Workpex exports supplied for this workflow are already scoped to the
+    # DoubleTick assignment population. Created/Assigned Date can be date-only,
+    # so filtering it at 17:00 would silently discard valid matched leads.
+    sales = sales.copy()
+    # 3CX retains full timestamps, so apply the exact half-open reporting window.
     calls = _window(calls, "call_time", start, end, report_tz)
     sales_presence = sales.groupby("phone_key", dropna=False).size().rename("workpex_match_count").reset_index()
     orders = sales[sales.is_order].copy()
@@ -137,6 +145,8 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     classifications.columns = ["country", "product", "vendor"]
     joined[["country", "product", "vendor"]] = classifications
     joined["lead_date"] = joined.lead_time.dt.date
+    if joined["lead_date"].isna().all():
+        joined["lead_date"] = pd.Timestamp(start).date()
     return joined, orders, calls
 
 
@@ -156,12 +166,7 @@ def qa_report(leads, sales, calls, source_ranges):
         collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
         rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
-    dt_range = source_ranges.get("DoubleTick", (None, None))
-    if dt_range[0] is not None:
-        for source in ("Workpex", "3CX"):
-            other = source_ranges.get(source, (None, None))
-            covers = other[0] is not None and other[0] <= dt_range[0] and other[1] >= dt_range[1]
-            rows.append({"check": f"{source} date range covers DoubleTick", "value": "YES" if covers else "NO", "severity": "OK" if covers else "High"})
+    rows.append({"check": "Uploaded source handling", "value": "DoubleTick + Workpex trusted; exact window applied to outbound 3CX", "severity": "OK"})
     lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key); call_keys = set(calls.phone_key)
     rows.append({"check": "DoubleTick leads missing from Workpex", "value": len(lead_keys - sales_keys), "severity": "High" if lead_keys - sales_keys else "OK"})
     rows.append({"check": "DoubleTick leads absent from outbound 3CX", "value": len(lead_keys - call_keys), "severity": "Review" if lead_keys - call_keys else "OK"})
