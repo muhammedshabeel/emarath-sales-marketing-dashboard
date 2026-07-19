@@ -16,6 +16,7 @@ def normalize_leads(df, mapping, source_tz, report_tz):
     out = pd.DataFrame(index=df.index)
     out["lead_phone"] = df[mapping["phone"]].astype(str)
     out["phone_key"] = last8(df[mapping["phone"]])
+    out["call_key"] = phone_digits(df[mapping["phone"]]).str[-9:]
     out["lead_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
     out["agent_number"] = df[mapping["agent_number"]].fillna("").astype(str) if mapping.get("agent_number") else ""
     agent_digits = phone_digits(out.agent_number)
@@ -73,7 +74,14 @@ def normalize_calls(df, mapping, source_tz, report_tz):
         direction = df[mapping["direction"]].fillna("").astype(str).str.strip().str.lower()
         df = df[direction.eq("outbound")].copy()
     out = pd.DataFrame(index=df.index)
-    out["phone_key"] = last8(df[mapping["phone"]])
+    call_digits = phone_digits(df[mapping["phone"]])
+    out["phone_key"] = call_digits.str[-8:]
+    out["call_key"] = call_digits.str[-9:]
+    out["call_number"] = call_digits
+    # 966 is the actual KSA calling code. Keep 996 as explicitly requested as
+    # well, so existing operational exports using it are not silently dropped.
+    gcc_prefixes = ("971", "973", "974", "966", "996")
+    out["call_region"] = call_digits.map(lambda value: "GCC" if str(value).startswith(gcc_prefixes) else "Other country")
     out["call_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
     out["call_agent"] = df[mapping["agent"]].fillna("").astype(str).str.strip() if mapping.get("agent") else ""
     out["call_status"] = df[mapping["call_status"]].fillna("").astype(str).str.strip() if mapping.get("call_status") else ""
@@ -111,21 +119,22 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     sales = sales.copy()
     # 3CX retains full timestamps, so apply the exact half-open reporting window.
     calls = _window(calls, "call_time", start, end, report_tz)
+    gcc_calls = calls[calls.call_region.eq("GCC")].copy()
     sales_presence = sales.groupby("phone_key", dropna=False).size().rename("workpex_match_count").reset_index()
     orders = sales[sales.is_order].copy()
     if orders.order_id.ne("").any():
         orders = orders.sort_values("sale_time").drop_duplicates("order_id", keep="last")
     order_agg = orders.groupby("phone_key", dropna=False).agg(order_count=("is_order", "size"), order_value=("order_amount", "sum"), order_products=("order_product", lambda x: ", ".join(sorted(set(v for v in x if v))))).reset_index()
-    call_agg = calls.groupby("phone_key", dropna=False).agg(call_count=("phone_key", "size"), answered_calls=("answered", "sum"), talk_seconds=("duration_seconds", "sum"), first_call_time=("call_time", "min"), last_call_time=("call_time", "max")).reset_index()
+    call_agg = gcc_calls.groupby("call_key", dropna=False).agg(call_count=("call_key", "size"), answered_calls=("answered", "sum"), talk_seconds=("duration_seconds", "sum"), first_call_time=("call_time", "min"), last_call_time=("call_time", "max")).reset_index()
     call_agg["unanswered_calls"] = call_agg.call_count - call_agg.answered_calls
-    if not calls.empty:
-        seq = calls.sort_values(["call_agent", "call_time"]).copy()
-        prev_same = seq.phone_key.eq(seq.phone_key.shift()) & seq.call_agent.eq(seq.call_agent.shift())
+    if not gcc_calls.empty:
+        seq = gcc_calls.sort_values(["call_agent", "call_time"]).copy()
+        prev_same = seq.call_key.eq(seq.call_key.shift()) & seq.call_agent.eq(seq.call_agent.shift())
         gap = seq.call_time.sub(seq.call_time.shift()).dt.total_seconds().div(60)
         seq["consecutive_unanswered_retry"] = (~seq.answered) & (~seq.answered.shift(fill_value=True)) & prev_same & gap.le(streak_gap_minutes)
-        retry = seq.groupby("phone_key").consecutive_unanswered_retry.sum().rename("consecutive_unanswered_retries").reset_index()
-        call_agg = call_agg.merge(retry, on="phone_key", how="left")
-    joined = leads.merge(sales_presence, on="phone_key", how="left").merge(order_agg, on="phone_key", how="left").merge(call_agg, on="phone_key", how="left")
+        retry = seq.groupby("call_key").consecutive_unanswered_retry.sum().rename("consecutive_unanswered_retries").reset_index()
+        call_agg = call_agg.merge(retry, on="call_key", how="left")
+    joined = leads.merge(sales_presence, on="phone_key", how="left").merge(order_agg, on="phone_key", how="left").merge(call_agg, on="call_key", how="left")
     for col in ("order_count", "order_value", "call_count", "answered_calls", "unanswered_calls", "talk_seconds", "consecutive_unanswered_retries"):
         if col not in joined: joined[col] = 0
         joined[col] = joined[col].fillna(0)
@@ -161,15 +170,19 @@ def grouped(joined, field):
 
 def qa_report(leads, sales, calls, source_ranges):
     rows = []
-    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key"), ("3CX", calls, "phone_key")):
+    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key"), ("3CX", calls, "call_key")):
         invalid = int(df[key].str.len().lt(8).sum()) if key in df else len(df)
         collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
         rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
     rows.append({"check": "Uploaded source handling", "value": "DoubleTick + Workpex trusted; exact window applied to outbound 3CX", "severity": "OK"})
-    lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key); call_keys = set(calls.phone_key)
+    lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key)
+    lead_call_keys = set(leads.call_key)
+    gcc_calls = calls[calls.call_region.eq("GCC")] if "call_region" in calls else calls
+    call_keys = set(gcc_calls.call_key)
     rows.append({"check": "DoubleTick leads missing from Workpex", "value": len(lead_keys - sales_keys), "severity": "High" if lead_keys - sales_keys else "OK"})
-    rows.append({"check": "DoubleTick leads absent from outbound 3CX", "value": len(lead_keys - call_keys), "severity": "Review" if lead_keys - call_keys else "OK"})
+    rows.append({"check": "DoubleTick leads absent from outbound GCC 3CX (last 9 digits)", "value": len(lead_call_keys - call_keys), "severity": "Review" if lead_call_keys - call_keys else "OK"})
     rows.append({"check": "Workpex rows unmatched to a lead", "value": len(sales_keys - lead_keys), "severity": "Review"})
-    rows.append({"check": "3CX numbers unmatched to a lead", "value": len(call_keys - lead_keys), "severity": "Review"})
+    rows.append({"check": "GCC 3CX numbers unmatched to a lead", "value": len(call_keys - lead_call_keys), "severity": "Review"})
+    rows.append({"check": "Other-country outbound 3CX calls shown separately", "value": int(calls.call_region.eq("Other country").sum()) if "call_region" in calls else 0, "severity": "Review"})
     return pd.DataFrame(rows)
