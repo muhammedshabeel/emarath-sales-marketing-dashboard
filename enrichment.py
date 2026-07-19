@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json, re, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import pandas as pd
 import requests
 from config import COUNTRY_ALIASES, PRODUCT_ALIASES, PRODUCT_VENDOR
@@ -8,6 +9,16 @@ from config import COUNTRY_ALIASES, PRODUCT_ALIASES, PRODUCT_VENDOR
 DT_URL = "https://public.doubletick.io/chat-messages"
 META_URL = "https://graph.facebook.com"
 LOCAL = threading.local()
+
+
+def _catalog():
+    path = Path(__file__).with_name("product_vendor_reference.csv")
+    if not path.exists(): return []
+    frame = pd.read_csv(path).fillna("")
+    return [(str(row.product_name).strip(), str(row.vendor_name).strip()) for row in frame.itertuples()]
+
+
+PRODUCT_CATALOG = _catalog()
 
 
 def _flatten(value, path=""):
@@ -40,13 +51,20 @@ def _messages(data):
     return []
 
 
+def _is_ad(message):
+    explicit = _pick(message, ["isFromAd", "fromAd", "isAd"]).lower()
+    raw = json.dumps(message, ensure_ascii=False).lower()
+    return explicit in ("true", "1", "yes") or any(x in raw for x in ("source_id", "sourceid", "ad_id", "adid", "ctwa_clid", '"referral"', "source_url", "thumbnail_url"))
+
+
+def _incoming(message):
+    return _pick(message, ["messageOriginType", "originType", "direction", "senderType"]).lower() in ("customer", "incoming", "inbound", "user")
+
+
 def _ad_message(messages):
-    candidates = []
-    for message in messages:
-        raw = json.dumps(message, ensure_ascii=False).lower()
-        explicit = str(message.get("isFromAd", "")).lower() in ("true", "1", "yes") if isinstance(message, dict) else False
-        if explicit or any(x in raw for x in ("source_id", "sourceid", "ad_id", "adid", "ctwa_clid", "ctwaclid", "adreferraldata", '"referral"')):
-            candidates.append(message)
+    ads = [message for message in messages if isinstance(message, dict) and _is_ad(message)]
+    customer_ads = [message for message in ads if _incoming(message)]
+    candidates = customer_ads or ads
     def ts(message):
         try: return float(_pick(message, ["messageTime", "timestamp", "createdAt", "sentAt"]) or "inf")
         except ValueError: return float("inf")
@@ -61,18 +79,22 @@ def enrich_doubletick(phones, api_key, wabas, start_date, end_date, workers=8, p
         errors = []
         for waba in wabas:
             for phone_format in (phone, "+" + phone):
-                try:
-                    r = requests.get(DT_URL, headers=headers, params={"wabaNumber": waba, "customerNumber": phone_format, "startDate": start, "endDate": end_exclusive}, timeout=45)
-                    if r.status_code == 429: time.sleep(2)
-                    r.raise_for_status()
-                    msgs = _messages(r.json() if r.text.strip() else {})
-                    if not msgs: continue
-                    ad = _ad_message(msgs)
-                    if not ad:
-                        return {"phone": phone, "waba_number": waba, "phone_format_used": phone_format, "messages_found": len(msgs), "ad_id": "", "campaign_id": "", "adset_id": "", "headline": "", "source_url": "", "ctwa_clid": "", "status": "CHAT_FOUND_NO_AD_ID", "raw_ad_json": "", "error": ""}
-                    ad_id = _pick(ad, ["source_id", "sourceId", "ad_id", "adId"])
-                    return {"phone": phone, "waba_number": waba, "phone_format_used": phone_format, "messages_found": len(msgs), "ad_id": ad_id, "campaign_id": _pick(ad, ["campaign_id", "campaignId"]), "adset_id": _pick(ad, ["adset_id", "adSetId", "adsetId"]), "headline": _pick(ad, ["headline", "title", "adHeadline"]), "source_url": _pick(ad, ["source_url", "sourceUrl"]), "ctwa_clid": _pick(ad, ["ctwa_clid", "ctwaClid"]), "status": "AD_ID_FOUND" if ad_id else "AD_MESSAGE_FOUND_ID_MISSING", "raw_ad_json": json.dumps(ad, ensure_ascii=False, separators=(",", ":")), "error": ""}
-                except Exception as exc: errors.append(str(exc)[:180])
+                for attempt in range(4):
+                    try:
+                        r = requests.get(DT_URL, headers=headers, params={"wabaNumber": waba, "customerNumber": phone_format, "startDate": start, "endDate": end_exclusive}, timeout=60)
+                        if r.status_code in (429, 500, 502, 503, 504):
+                            time.sleep(min(2 ** (attempt + 1), 20)); continue
+                        r.raise_for_status()
+                        msgs = _messages(r.json() if r.text.strip() else {})
+                        if not msgs: break
+                        ad = _ad_message(msgs)
+                        if not ad:
+                            return {"phone": phone, "waba_number": waba, "phone_format_used": phone_format, "messages_found": len(msgs), "ad_id": "", "campaign_id": "", "adset_id": "", "headline": "", "source_url": "", "ctwa_clid": "", "status": "CHAT_FOUND_NO_AD_ID", "raw_ad_json": "", "error": ""}
+                        ad_id = _pick(ad, ["source_id", "sourceId", "ad_id", "adId"])
+                        return {"phone": phone, "waba_number": waba, "phone_format_used": phone_format, "messages_found": len(msgs), "ad_id": ad_id, "campaign_id": _pick(ad, ["campaign_id", "campaignId"]), "adset_id": _pick(ad, ["adset_id", "adSetId", "adsetId"]), "headline": _pick(ad, ["headline", "title", "adHeadline"]), "source_url": _pick(ad, ["source_url", "sourceUrl"]), "ctwa_clid": _pick(ad, ["ctwa_clid", "ctwaClid"]), "status": "AD_ID_FOUND" if ad_id else "AD_MESSAGE_FOUND_ID_MISSING", "raw_ad_json": json.dumps(ad, ensure_ascii=False, separators=(",", ":")), "error": ""}
+                    except Exception as exc:
+                        errors.append(str(exc)[:180])
+                        if attempt < 3: time.sleep(min(2 ** (attempt + 1), 20))
         return {"phone": phone, "waba_number": "", "phone_format_used": "", "messages_found": 0, "ad_id": "", "campaign_id": "", "adset_id": "", "headline": "", "source_url": "", "ctwa_clid": "", "status": "API_ERROR" if errors else "NO_CHAT_FOUND", "raw_ad_json": "", "error": " | ".join(errors[:2])}
     unique = list(dict.fromkeys(str(x) for x in phones if len(str(x)) >= 8))
     rows = []
@@ -111,14 +133,26 @@ def enrich_meta(ad_ids, token, workers=8, progress=None):
 
 
 def classify_campaign(name):
-    text = re.sub(r"[_|]+", " ", str(name or "")).upper()
+    text = re.sub(r"[_|\-]+", " ", str(name or "")).upper()
     text = re.sub(r"\s+", " ", text)
+    compact = re.sub(r"[^A-Z0-9]", "", text)
     country = "Unmapped"
     for canonical, aliases in COUNTRY_ALIASES.items():
         if any(re.search(rf"(?<![A-Z]){re.escape(a)}(?![A-Z])", text) for a in aliases):
             country = canonical; break
     product = "Unmapped"
+    vendor = "Unmapped"
+    # The uploaded product/vendor reference is authoritative. Prefer the
+    # longest matching product so specific collection names beat short aliases.
+    matches = []
+    for catalog_product, catalog_vendor in PRODUCT_CATALOG:
+        product_key = re.sub(r"[^A-Z0-9]", "", catalog_product.upper())
+        if product_key and product_key in compact:
+            matches.append((len(product_key), catalog_product.title(), catalog_vendor.title()))
+    if matches:
+        _, product, vendor = max(matches)
     for canonical, aliases in PRODUCT_ALIASES.items():
-        if any(re.search(rf"(?<![A-Z]){re.escape(a)}(?![A-Z])", text) for a in aliases):
-            product = canonical; break
-    return country, product, PRODUCT_VENDOR.get(product, "Unmapped")
+        if product != "Unmapped": break
+        if any(re.sub(r"[^A-Z0-9]", "", a.upper()) in compact for a in aliases):
+            product = canonical; vendor = PRODUCT_VENDOR.get(product, "Unmapped"); break
+    return country, product, vendor
