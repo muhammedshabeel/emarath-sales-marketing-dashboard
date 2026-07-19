@@ -1,0 +1,7 @@
+streamlit>=1.37,<2
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+requests>=2.32,<3
+plotly>=5.22,<7
+python-dateutil>=2.9,<3
+

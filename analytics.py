@@ -1,0 +1,170 @@
+from __future__ import annotations
+import pandas as pd
+from config import AGENT_PHONE_NAME, ANSWERED_WORDS, WON_WORDS
+from data_io import last8, parse_duration_seconds, phone_digits
+from enrichment import classify_campaign
+
+
+def parse_time(series, source_tz, report_tz):
+    dt = pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
+    if getattr(dt.dt, "tz", None) is None:
+        dt = dt.dt.tz_localize(source_tz, ambiguous="NaT", nonexistent="shift_forward")
+    return dt.dt.tz_convert(report_tz)
+
+
+def normalize_leads(df, mapping, source_tz, report_tz):
+    out = pd.DataFrame(index=df.index)
+    out["lead_phone"] = df[mapping["phone"]].astype(str)
+    out["phone_key"] = last8(df[mapping["phone"]])
+    out["lead_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
+    out["agent_number"] = df[mapping["agent_number"]].fillna("").astype(str) if mapping.get("agent_number") else ""
+    agent_digits = phone_digits(out.agent_number)
+    out["agent"] = agent_digits.map(AGENT_PHONE_NAME).fillna("UNMAPPED AGENT")
+    out["ad_id"] = ""
+    out["campaign_name"] = ""
+    out["lead_row"] = range(1, len(out) + 1)
+    return out
+
+
+def normalize_attribution(df, mapping):
+    out = pd.DataFrame(index=df.index)
+    out["phone_key"] = last8(df[mapping["phone"]])
+    out["attribution_phone"] = df[mapping["phone"]].fillna("").astype(str)
+    out["ad_id_attr"] = df[mapping["ad_id"]].fillna("").astype(str).str.replace(r"\.0$", "", regex=True) if mapping.get("ad_id") else ""
+    out["campaign_name_attr"] = df[mapping["campaign"]].fillna("").astype(str).str.strip() if mapping.get("campaign") else ""
+    out["attribution_status"] = df[mapping["status"]].fillna("").astype(str).str.strip() if mapping.get("status") else ""
+    # One customer should have one attribution row. Prefer a row with campaign,
+    # then Ad ID, while retaining duplicate counts for QA.
+    out["attribution_match_count"] = out.groupby("phone_key").phone_key.transform("size")
+    out["_score"] = out.campaign_name_attr.ne("").astype(int) * 2 + out.ad_id_attr.ne("").astype(int)
+    return out.sort_values(["phone_key", "_score"], ascending=[True, False]).drop_duplicates("phone_key").drop(columns="_score")
+
+
+def attach_attribution(leads, attribution):
+    out = leads.merge(attribution, on="phone_key", how="left")
+    out["ad_id"] = out.ad_id_attr.fillna("")
+    out["campaign_name"] = out.campaign_name_attr.fillna("")
+    out["attribution_found"] = out.attribution_phone.notna()
+    out["attribution_match_count"] = out.attribution_match_count.fillna(0).astype(int)
+    return out
+
+
+def normalize_sales(df, mapping, source_tz, report_tz):
+    out = pd.DataFrame(index=df.index)
+    out["phone_key"] = last8(df[mapping["phone"]])
+    out["sale_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
+    out["sales_agent"] = df[mapping["agent"]].fillna("").astype(str).str.strip() if mapping.get("agent") else ""
+    out["order_id"] = df[mapping["order_id"]].fillna("").astype(str).str.strip() if mapping.get("order_id") else ""
+    out["order_status"] = df[mapping["status"]].fillna("").astype(str).str.strip() if mapping.get("status") else ""
+    out["order_product"] = df[mapping["product"]].fillna("").astype(str).str.strip() if mapping.get("product") else ""
+    if mapping.get("amount"):
+        amount = df[mapping["amount"]].fillna("").astype(str).str.replace(",", "", regex=False).str.replace(r"[^0-9.\-]", "", regex=True)
+        out["order_amount"] = pd.to_numeric(amount, errors="coerce").fillna(0)
+    else:
+        out["order_amount"] = 0.0
+    status = out.order_status.str.lower().str.strip()
+    out["is_order"] = status.isin(WON_WORDS) | status.str.contains("won|convert|confirm|ready to dispatch|date shipment|success|sold", regex=True, na=False)
+    if not mapping.get("status"): out["is_order"] = True
+    return out
+
+
+def normalize_calls(df, mapping, source_tz, report_tz):
+    if mapping.get("direction"):
+        direction = df[mapping["direction"]].fillna("").astype(str).str.strip().str.lower()
+        df = df[direction.eq("outbound")].copy()
+    out = pd.DataFrame(index=df.index)
+    out["phone_key"] = last8(df[mapping["phone"]])
+    out["call_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
+    out["call_agent"] = df[mapping["agent"]].fillna("").astype(str).str.strip() if mapping.get("agent") else ""
+    out["call_status"] = df[mapping["call_status"]].fillna("").astype(str).str.strip() if mapping.get("call_status") else ""
+    out["duration_seconds"] = parse_duration_seconds(df[mapping["duration"]]) if mapping.get("duration") else 0.0
+    status = out.call_status.str.lower().str.strip()
+    explicitly_unanswered = status.str.contains("unanswered|not answered|no answer|missed|failed|busy|cancel", regex=True, na=False)
+    positively_answered = status.isin(ANSWERED_WORDS) | status.str.contains(r"\b(?:answered|connected|completed|talked|success)\b", regex=True, na=False)
+    out["answered"] = (~explicitly_unanswered) & (positively_answered | out.duration_seconds.gt(0))
+    return out
+
+
+def agent_directory_frame():
+    return pd.DataFrame([{"agent_number": number, "agent": name} for number, name in AGENT_PHONE_NAME.items()]).sort_values("agent")
+
+
+def _window(df, col, start, end, report_tz):
+    if col not in df or df[col].isna().all(): return df.copy()
+    lo = pd.Timestamp(start).tz_localize(report_tz)
+    hi = (pd.Timestamp(end) + pd.Timedelta(days=1)).tz_localize(report_tz)
+    return df[df[col].ge(lo) & df[col].lt(hi)].copy()
+
+
+def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minutes=15):
+    # The DoubleTick export is authoritative: every uploaded row is an assigned
+    # lead for the chosen reporting period. Never discard it using historical
+    # customer timestamps such as First message received at.
+    leads = leads.copy()
+    sales = _window(sales, "sale_time", start, end, report_tz)
+    calls = _window(calls, "call_time", start, end, report_tz)
+    sales_presence = sales.groupby("phone_key", dropna=False).size().rename("workpex_match_count").reset_index()
+    orders = sales[sales.is_order].copy()
+    if orders.order_id.ne("").any():
+        orders = orders.sort_values("sale_time").drop_duplicates("order_id", keep="last")
+    order_agg = orders.groupby("phone_key", dropna=False).agg(order_count=("is_order", "size"), order_value=("order_amount", "sum"), order_products=("order_product", lambda x: ", ".join(sorted(set(v for v in x if v))))).reset_index()
+    call_agg = calls.groupby("phone_key", dropna=False).agg(call_count=("phone_key", "size"), answered_calls=("answered", "sum"), talk_seconds=("duration_seconds", "sum"), first_call_time=("call_time", "min"), last_call_time=("call_time", "max")).reset_index()
+    call_agg["unanswered_calls"] = call_agg.call_count - call_agg.answered_calls
+    if not calls.empty:
+        seq = calls.sort_values(["call_agent", "call_time"]).copy()
+        prev_same = seq.phone_key.eq(seq.phone_key.shift()) & seq.call_agent.eq(seq.call_agent.shift())
+        gap = seq.call_time.sub(seq.call_time.shift()).dt.total_seconds().div(60)
+        seq["consecutive_unanswered_retry"] = (~seq.answered) & (~seq.answered.shift(fill_value=True)) & prev_same & gap.le(streak_gap_minutes)
+        retry = seq.groupby("phone_key").consecutive_unanswered_retry.sum().rename("consecutive_unanswered_retries").reset_index()
+        call_agg = call_agg.merge(retry, on="phone_key", how="left")
+    joined = leads.merge(sales_presence, on="phone_key", how="left").merge(order_agg, on="phone_key", how="left").merge(call_agg, on="phone_key", how="left")
+    for col in ("order_count", "order_value", "call_count", "answered_calls", "unanswered_calls", "talk_seconds", "consecutive_unanswered_retries"):
+        if col not in joined: joined[col] = 0
+        joined[col] = joined[col].fillna(0)
+    joined["converted"] = joined.order_count.gt(0)
+    joined["workpex_match_count"] = joined.workpex_match_count.fillna(0).astype(int)
+    joined["workpex_found"] = joined.workpex_match_count.gt(0)
+    joined["workpex_reconciliation"] = "FOUND"
+    joined.loc[~joined.workpex_found, "workpex_reconciliation"] = "MISSING FROM WORKPEX"
+    joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE WORKPEX MATCHES"
+    joined["called"] = joined.call_count.gt(0)
+    joined["answered_any"] = joined.answered_calls.gt(0)
+    if joined.lead_time.notna().any():
+        joined["speed_to_first_call_minutes"] = (joined.first_call_time - joined.lead_time).dt.total_seconds().div(60)
+    else:
+        joined["speed_to_first_call_minutes"] = float("nan")
+    classifications = joined.campaign_name.map(classify_campaign).apply(pd.Series)
+    classifications.columns = ["country", "product", "vendor"]
+    joined[["country", "product", "vendor"]] = classifications
+    joined["lead_date"] = joined.lead_time.dt.date
+    return joined, orders, calls
+
+
+def grouped(joined, field):
+    if joined.empty: return pd.DataFrame()
+    out = joined.groupby(field, dropna=False).agg(leads=("lead_row", "size"), missing_from_workpex=("workpex_found", lambda x: (~x).sum()), called_leads=("called", "sum"), answered_leads=("answered_any", "sum"), orders=("order_count", "sum"), revenue=("order_value", "sum"), total_calls=("call_count", "sum"), unanswered_calls=("unanswered_calls", "sum"), repeat_unanswered=("consecutive_unanswered_retries", "sum"), avg_first_call_min=("speed_to_first_call_minutes", "mean")).reset_index()
+    out["conversion_rate"] = out.orders.div(out.leads).mul(100)
+    out["call_coverage"] = out.called_leads.div(out.leads).mul(100)
+    out["answer_rate"] = out.answered_leads.div(out.called_leads.replace(0, pd.NA)).mul(100)
+    return out.sort_values("leads", ascending=False)
+
+
+def qa_report(leads, sales, calls, source_ranges):
+    rows = []
+    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key"), ("3CX", calls, "phone_key")):
+        invalid = int(df[key].str.len().lt(8).sum()) if key in df else len(df)
+        collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
+        rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
+        rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
+    dt_range = source_ranges.get("DoubleTick", (None, None))
+    if dt_range[0] is not None:
+        for source in ("Workpex", "3CX"):
+            other = source_ranges.get(source, (None, None))
+            covers = other[0] is not None and other[0] <= dt_range[0] and other[1] >= dt_range[1]
+            rows.append({"check": f"{source} date range covers DoubleTick", "value": "YES" if covers else "NO", "severity": "OK" if covers else "High"})
+    lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key); call_keys = set(calls.phone_key)
+    rows.append({"check": "DoubleTick leads missing from Workpex", "value": len(lead_keys - sales_keys), "severity": "High" if lead_keys - sales_keys else "OK"})
+    rows.append({"check": "DoubleTick leads absent from outbound 3CX", "value": len(lead_keys - call_keys), "severity": "Review" if lead_keys - call_keys else "OK"})
+    rows.append({"check": "Workpex rows unmatched to a lead", "value": len(sales_keys - lead_keys), "severity": "Review"})
+    rows.append({"check": "3CX numbers unmatched to a lead", "value": len(call_keys - lead_keys), "severity": "Review"})
+    return pd.DataFrame(rows)
