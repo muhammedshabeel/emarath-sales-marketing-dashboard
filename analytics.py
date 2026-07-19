@@ -117,8 +117,9 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     # DoubleTick assignment population. Created/Assigned Date can be date-only,
     # so filtering it at 17:00 would silently discard valid matched leads.
     sales = sales.copy()
-    # 3CX retains full timestamps, so apply the exact half-open reporting window.
-    calls = _window(calls, "call_time", start, end, report_tz)
+    # The uploaded 3CX export is already scoped to the intended reporting
+    # period. Keep every uploaded outbound row; do not impose a fixed time cut.
+    calls = calls.copy()
     gcc_calls = calls[calls.call_region.eq("GCC")].copy()
     sales_presence = sales.groupby("phone_key", dropna=False).size().rename("workpex_match_count").reset_index()
     orders = sales[sales.is_order].copy()
@@ -177,7 +178,7 @@ def qa_report(leads, sales, calls, source_ranges):
         collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
         rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
-    rows.append({"check": "Uploaded source handling", "value": "DoubleTick + Workpex trusted; exact window applied to outbound 3CX", "severity": "OK"})
+    rows.append({"check": "Uploaded source handling", "value": "DoubleTick + Workpex + 3CX trusted as prefiltered uploads", "severity": "OK"})
     lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key)
     lead_call_keys = set(leads.call_key)
     gcc_calls = calls[calls.call_region.eq("GCC")] if "call_region" in calls else calls
