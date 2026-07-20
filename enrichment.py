@@ -21,6 +21,17 @@ def _catalog():
 PRODUCT_CATALOG = _catalog()
 
 
+def _session():
+    """One pooled HTTP session per worker thread."""
+    if not hasattr(LOCAL, "session"):
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        LOCAL.session = session
+    return LOCAL.session
+
+
 def _flatten(value, path=""):
     out = []
     if isinstance(value, dict):
@@ -81,7 +92,7 @@ def enrich_doubletick(phones, api_key, wabas, start_date, end_date, workers=8, p
             for phone_format in (phone, "+" + phone):
                 for attempt in range(4):
                     try:
-                        r = requests.get(DT_URL, headers=headers, params={"wabaNumber": waba, "customerNumber": phone_format, "startDate": start, "endDate": end_exclusive}, timeout=60)
+                        r = _session().get(DT_URL, headers=headers, params={"wabaNumber": waba, "customerNumber": phone_format, "startDate": start, "endDate": end_exclusive}, timeout=60)
                         if r.status_code in (429, 500, 502, 503, 504):
                             time.sleep(min(2 ** (attempt + 1), 20)); continue
                         r.raise_for_status()
@@ -108,7 +119,7 @@ def enrich_doubletick(phones, api_key, wabas, start_date, end_date, workers=8, p
 
 def enrich_meta(ad_ids, token, workers=8, progress=None):
     def get(object_id, fields):
-        r = requests.get(f"{META_URL}/{object_id}", params={"fields": fields, "access_token": token}, timeout=45)
+        r = _session().get(f"{META_URL}/{object_id}", params={"fields": fields, "access_token": token}, timeout=45)
         data = r.json() if r.text.strip() else {}
         if not r.ok: raise RuntimeError(data.get("error", {}).get("message", r.text[:300]))
         return data
@@ -133,7 +144,8 @@ def enrich_meta(ad_ids, token, workers=8, progress=None):
 
 
 def generate_fixed_zip_report(phones, api_key, meta_token, wabas, start_date, end_date,
-                              doubletick_progress=None, meta_progress=None):
+                              doubletick_progress=None, meta_progress=None,
+                              doubletick_workers=24, meta_workers=16):
     """Run the integrated ZIP workflow with a freshly replaced phone list.
 
     ``phones`` is rebuilt exclusively from the current DoubleTick all-customer
@@ -147,9 +159,9 @@ def generate_fixed_zip_report(phones, api_key, meta_token, wabas, start_date, en
     ))
     report = enrich_doubletick(
         phone_list, api_key, wabas, start_date, end_date,
-        progress=doubletick_progress,
+        workers=doubletick_workers, progress=doubletick_progress,
     )
-    meta = enrich_meta(report.ad_id, meta_token, progress=meta_progress)
+    meta = enrich_meta(report.ad_id, meta_token, workers=meta_workers, progress=meta_progress)
     report["ad_id_join"] = report.ad_id.astype(str)
     report = report.merge(meta, on="ad_id_join", how="left").drop(columns="ad_id_join")
     meta_cols = ["meta_ad_name", "meta_adset_id", "meta_adset_name", "meta_campaign_id", "meta_campaign_name", "meta_lookup_status", "meta_error"]
