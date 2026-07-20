@@ -23,6 +23,7 @@ WORKPEX_AGENT_ALIASES = {
     "SHAMNA NAJIYA": "SHAMNA NAJIYA",
     "HASNA H": "Hasna",
     "ADNAN S": "ADNAN",
+    "MOINUDEEEN M": "Moinudeen",
 }
 
 
@@ -41,6 +42,82 @@ def normalize_workpex_agent(value):
     return WORKPEX_AGENT_ALIASES.get(distinct[0], labels[0])
 
 
+ORDER_COUNTRY_PREFIXES = {
+    "UAE": "971",
+    "UNITED ARAB EMIRATES": "971",
+    "BAHRAIN": "973",
+    "QATAR": "974",
+    "KSA": "966",
+    "SAUDI ARABIA": "966",
+}
+
+
+def _clean_text(value):
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def _crm_phone_series(values, countries):
+    digits = phone_digits(values).str.lstrip("0")
+    prefixes = countries.str.upper().map(ORDER_COUNTRY_PREFIXES).fillna("")
+    local_lengths = prefixes.map({"971": 9, "973": 8, "974": 8, "966": 9})
+    needs_prefix = prefixes.ne("") & digits.str.len().eq(local_lengths) & ~digits.str.startswith(("971", "973", "974", "966"))
+    return digits.mask(needs_prefix, prefixes + digits)
+
+
+def normalize_google_crm_orders(df, generated_phones, report_tz="Asia/Dubai"):
+    """Normalize live CRM rows and attribute orders by verified phone match.
+
+    Phone membership in the freshly generated DoubleTick report always wins.
+    Customer Path is consulted only when neither CRM phone belongs to that
+    generated list.
+    """
+    leads = phone_digits(pd.Series(list(generated_phones), dtype="object"))
+    lead_set = set(leads[leads.ne("")])
+    countries = df["COUNTRY"].map(_clean_text)
+    phone1 = _crm_phone_series(df["NUMBER1"], countries)
+    phone2 = _crm_phone_series(df["NUMBER2"], countries)
+    matched_phone = phone1.where(phone1.isin(lead_set), phone2.where(phone2.isin(lead_set), ""))
+    customer_path = df["Customer Path"].map(_clean_text)
+    tracking = df["TRACKING NUM"].map(_clean_text).str.replace(r"\.0$", "", regex=True)
+    em_number = df["EM NUMBER"].map(_clean_text)
+    row_fallback = pd.Series([f"CRM-{position + 2}" for position in range(len(df))], index=df.index)
+    order_id = tracking.where(tracking.ne(""), em_number.where(em_number.ne(""), row_fallback))
+    product1 = df["PRODUCT 1"].map(_clean_text)
+    product2 = df["PRODUCT 2"].map(_clean_text)
+    products = product1.where(product2.eq(""), product1 + ", " + product2).str.strip(", ")
+    out = pd.DataFrame({
+        "phone_key": matched_phone.where(matched_phone.ne(""), phone1.where(phone1.ne(""), phone2)).str[-8:],
+        "sale_time": df["DATE"],
+        "sales_agent": df["AGENT"].map(normalize_workpex_agent),
+        "order_id": order_id,
+        "order_status": df["CS STATUS"].map(_clean_text),
+        "order_product": products,
+        "order_amount": pd.to_numeric(df["VALUE"], errors="coerce"),
+        "is_order": True,
+        "order_from_generated_lead": matched_phone.ne(""),
+        "matched_lead_phone": matched_phone,
+        "crm_phone_1": phone1,
+        "crm_phone_2": phone2,
+        "customer_path": customer_path,
+        "order_source": customer_path.where(customer_path.ne(""), "Other / Unknown").mask(matched_phone.ne(""), "Generated DoubleTick lead"),
+        "country": countries,
+        "vendor": df["VENDOR"].map(_clean_text),
+    })
+    if out.empty:
+        return pd.DataFrame(columns=[
+            "phone_key", "sale_time", "sales_agent", "order_id", "order_status",
+            "order_product", "order_amount", "is_order", "order_from_generated_lead",
+            "matched_lead_phone", "crm_phone_1", "crm_phone_2", "customer_path",
+            "order_source", "country", "vendor",
+        ])
+    out["sale_time"] = pd.to_datetime(out["sale_time"], errors="coerce", dayfirst=True, format="mixed")
+    out["sale_time"] = out["sale_time"].dt.tz_localize(report_tz, ambiguous="NaT", nonexistent="shift_forward")
+    out["order_amount"] = pd.to_numeric(out["order_amount"], errors="coerce").fillna(0.0)
+    # Tracking number is authoritative; EM number/row fallback keeps countries
+    # whose logistics tracking is still blank at one order per CRM row.
+    return out.drop_duplicates("order_id", keep="last").reset_index(drop=True)
+
+
 def parse_time(series, source_tz, report_tz):
     dt = pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
     if getattr(dt.dt, "tz", None) is None:
@@ -50,10 +127,10 @@ def parse_time(series, source_tz, report_tz):
 
 def normalize_leads(df, mapping, source_tz, report_tz):
     out = pd.DataFrame(index=df.index)
-    out["lead_phone"] = df[mapping["phone"]].astype(str)
-    out["phone_key"] = last8(df[mapping["phone"]])
-    out["call_key"] = phone_digits(df[mapping["phone"]]).str[-9:]
     lead_digits = phone_digits(df[mapping["phone"]])
+    out["lead_phone"] = lead_digits
+    out["phone_key"] = lead_digits.str[-8:]
+    out["call_key"] = lead_digits.str[-9:]
     gcc_prefixes = ("971", "973", "974", "966", "996")
     out["lead_region"] = lead_digits.map(lambda value: "GCC" if str(value).startswith(gcc_prefixes) else "Other country")
     out["lead_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
@@ -152,9 +229,9 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     # lead for the chosen reporting period. Never discard it using historical
     # customer timestamps such as First message received at.
     leads = leads.copy()
-    # Workpex exports supplied for this workflow are already scoped to the
-    # DoubleTick assignment population. Created/Assigned Date can be date-only,
-    # so filtering it at 17:00 would silently discard valid matched leads.
+    # Google CRM rows are loaded from 1 July onward and are authoritative.
+    # Their dates are date-only, so an intraday DoubleTick window must not
+    # discard otherwise valid phone-matched orders.
     sales = sales.copy()
     # The window is user-selectable. When disabled, trust the full uploaded
     # 3CX export. Never discard local-format destinations before last-9 matching.
@@ -180,9 +257,9 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     joined["converted"] = joined.order_count.gt(0)
     joined["workpex_match_count"] = joined.workpex_match_count.fillna(0).astype(int)
     joined["workpex_found"] = joined.workpex_match_count.gt(0)
-    joined["workpex_reconciliation"] = "FOUND"
-    joined.loc[~joined.workpex_found, "workpex_reconciliation"] = "MISSING FROM WORKPEX"
-    joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE WORKPEX MATCHES"
+    joined["workpex_reconciliation"] = "FOUND IN GOOGLE CRM"
+    joined.loc[~joined.workpex_found, "workpex_reconciliation"] = "NO MATCHING GOOGLE CRM ORDER"
+    joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE GOOGLE CRM ORDERS"
     joined["called"] = joined.lead_region.eq("GCC") & joined.call_count.gt(0)
     joined["answered_any"] = joined.lead_region.eq("GCC") & joined.answered_calls.gt(0)
     if joined.lead_time.notna().any():
@@ -212,19 +289,19 @@ def grouped(joined, field):
 
 def qa_report(leads, sales, calls, source_ranges):
     rows = []
-    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key"), ("3CX", calls, "call_key")):
+    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Google CRM", sales, "phone_key"), ("3CX", calls, "call_key")):
         invalid = int(df[key].str.len().lt(8).sum()) if key in df else len(df)
         collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
         rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
-    rows.append({"check": "Uploaded source handling", "value": "DoubleTick + Workpex + 3CX trusted as prefiltered uploads", "severity": "OK"})
+    rows.append({"check": "Source handling", "value": "DoubleTick + live Google CRM + 3CX", "severity": "OK"})
     lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key)
     gcc_leads = leads[leads.lead_region.eq("GCC")] if "lead_region" in leads else leads
     lead_call_keys = set(gcc_leads.call_key)
     call_keys = set(calls.call_key)
-    rows.append({"check": "DoubleTick leads missing from Workpex", "value": len(lead_keys - sales_keys), "severity": "High" if lead_keys - sales_keys else "OK"})
+    rows.append({"check": "DoubleTick leads without a Google CRM order", "value": len(lead_keys - sales_keys), "severity": "Review" if lead_keys - sales_keys else "OK"})
     rows.append({"check": "DoubleTick leads absent from outbound GCC 3CX (last 9 digits)", "value": len(lead_call_keys - call_keys), "severity": "Review" if lead_call_keys - call_keys else "OK"})
-    rows.append({"check": "Workpex rows unmatched to a lead", "value": len(sales_keys - lead_keys), "severity": "Review"})
+    rows.append({"check": "Google CRM orders from other sources", "value": int((~sales.order_from_generated_lead).sum()) if "order_from_generated_lead" in sales else len(sales_keys - lead_keys), "severity": "Review"})
     rows.append({"check": "GCC 3CX numbers unmatched to a lead", "value": len(call_keys - lead_call_keys), "severity": "Review"})
     rows.append({"check": "Other-country DoubleTick leads shown separately", "value": int(leads.lead_region.eq("Other country").sum()) if "lead_region" in leads else 0, "severity": "Review"})
     return pd.DataFrame(rows)
