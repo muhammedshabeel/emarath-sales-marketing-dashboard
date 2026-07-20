@@ -3,10 +3,8 @@ import io
 from datetime import date, time, timedelta
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-from plotly.subplots import make_subplots
 from urllib.parse import quote
 
 from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_google_crm_orders, normalize_leads, qa_report
@@ -37,7 +35,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 19
+ANALYSIS_SCHEMA_VERSION = 20
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -97,6 +95,7 @@ def load_google_campaign_spend(window_start_date, window_end_date):
             dates = pd.to_datetime(frame["Window End Date (Dubai)"], errors="coerce").dt.date
             in_window = dates.ge(window_start_date) & dates.le(window_end_date)
             frame = frame.loc[in_window, ["Campaign Name", "Campaign ID", "Spend"]].copy()
+            frame["spend_date"] = dates.loc[in_window].values
             if frame.empty:
                 continue
             frame["Spend"] = pd.to_numeric(frame["Spend"], errors="coerce").fillna(0.0)
@@ -124,9 +123,14 @@ def load_google_campaign_spend(window_start_date, window_end_date):
         errors.append(f"Meta Report (5pm-5pm): {str(exc)[:120]}")
     if not frames:
         empty = pd.DataFrame(columns=["campaign_name_spend", "campaign_key", "spend", "spend_accounts"])
-        return empty, errors, authoritative_total, daily_spend
+        empty_daily = pd.DataFrame(columns=["spend_date", "campaign_name_spend", "campaign_key", "spend", "spend_accounts"])
+        return empty, errors, authoritative_total, daily_spend, empty_daily
     raw = pd.concat(frames, ignore_index=True)
     raw["campaign_key"] = campaign_key(raw["Campaign Name"])
+    daily_campaign_spend = raw.rename(columns={
+        "Campaign Name": "campaign_name_spend", "Account": "spend_accounts"
+    })[["spend_date", "campaign_name_spend", "campaign_key", "Spend", "spend_accounts"]]
+    daily_campaign_spend = daily_campaign_spend.rename(columns={"Spend": "spend"})
     grouped_spend = raw.groupby(["campaign_key", "Campaign Name"], as_index=False).agg(
         spend=("Spend", "sum"),
         spend_accounts=("Account", lambda values: ", ".join(sorted(set(values)))),
@@ -139,7 +143,7 @@ def load_google_campaign_spend(window_start_date, window_end_date):
         if abs(difference) <= 0.05 and difference:
             largest = grouped_spend["spend"].idxmax()
             grouped_spend.loc[largest, "spend"] += difference
-    return grouped_spend, errors, authoritative_total, daily_spend
+    return grouped_spend, errors, authoritative_total, daily_spend, daily_campaign_spend
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -214,25 +218,45 @@ def country_performance(joined, spend_data):
     return result
 
 
-def daily_marketing_performance(joined, daily_spend):
-    dates = pd.DataFrame({
-        "date": pd.date_range(SPEND_START_DATE, SPEND_END_DATE, freq="D").date
-    })
+def aggregate_campaign_spend(daily_campaign_spend, authoritative_total=None):
+    if daily_campaign_spend.empty:
+        return pd.DataFrame(columns=["campaign_name_spend", "campaign_key", "spend", "spend_accounts"])
+    grouped_spend = daily_campaign_spend.groupby(
+        ["campaign_key", "campaign_name_spend"], as_index=False
+    ).agg(
+        spend=("spend", "sum"),
+        spend_accounts=("spend_accounts", lambda values: ", ".join(sorted(set(values)))),
+    )
+    if authoritative_total is not None and not grouped_spend.empty:
+        difference = round(float(authoritative_total) - float(grouped_spend["spend"].sum()), 2)
+        if abs(difference) <= 0.05 and difference:
+            grouped_spend.loc[grouped_spend["spend"].idxmax(), "spend"] += difference
+    return grouped_spend
+
+
+def daily_dimension_performance(joined, daily_campaign_spend, dimension):
     attributed = joined[joined["campaign_name"].fillna("").astype(str).str.strip().ne("")].copy()
     attributed["date"] = pd.to_datetime(attributed["lead_time"], errors="coerce").dt.date
-    daily_leads = attributed.groupby("date", as_index=False).agg(
-        leads=("lead_row", "size"),
-        orders=("converted", "sum"),
-        revenue=("order_value", "sum"),
+    attributed[dimension] = attributed[dimension].astype("string")
+    daily_leads = attributed.groupby(["date", dimension], as_index=False).agg(
+        leads=("lead_row", "size"), orders=("converted", "sum"), revenue=("order_value", "sum")
     )
-    result = dates.merge(daily_spend, on="date", how="left").merge(daily_leads, on="date", how="left")
+
+    spend_rows = daily_campaign_spend.copy()
+    classification_index = {"country": 0, "vendor": 2}[dimension]
+    spend_rows[dimension] = spend_rows["campaign_name_spend"].map(
+        lambda value: str(classify_campaign(value)[classification_index])
+    )
+    spend_rows["date"] = spend_rows["spend_date"]
+    daily_dimension_spend = spend_rows.groupby(["date", dimension], as_index=False)["spend"].sum()
+    result = daily_leads.merge(daily_dimension_spend, on=["date", dimension], how="outer")
     for column in ["spend", "leads", "orders", "revenue"]:
         result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
     result["leads"] = result["leads"].astype(int)
     result["orders"] = result["orders"].astype(int)
     result["cpl"] = result["spend"].div(result["leads"].replace(0, pd.NA))
     result["conversion_rate"] = result["orders"].div(result["leads"].replace(0, pd.NA)).mul(100)
-    return result
+    return result.sort_values(["date", dimension])
 
 
 def mapping_ui(df, source):
@@ -427,7 +451,7 @@ if "analysis_inputs" in st.session_state:
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
     ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Google CRM orders": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
-    spend_data, spend_errors, authoritative_spend, daily_spend = load_google_campaign_spend(
+    spend_data, spend_errors, authoritative_spend, daily_spend, daily_campaign_spend = load_google_campaign_spend(
         SPEND_START_DATE, SPEND_END_DATE
     )
     st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors)
@@ -486,18 +510,43 @@ with tabs[0]:
     st.dataframe(failures, hide_index=True, use_container_width=True)
 
 with tabs[1]:
-    missing_attr = joined[~joined.attribution_found].copy() if "attribution_found" in joined else joined.iloc[0:0]
+    selected_period = st.date_input(
+        "Marketing date range",
+        value=(SPEND_START_DATE, SPEND_END_DATE),
+        min_value=SPEND_START_DATE,
+        max_value=SPEND_END_DATE,
+        format="DD/MM/YYYY",
+    )
+    if isinstance(selected_period, (tuple, list)) and len(selected_period) == 2:
+        marketing_start, marketing_end = selected_period
+    else:
+        marketing_start = marketing_end = selected_period
+    if marketing_start > marketing_end:
+        st.error("The marketing start date must be on or before the end date.")
+        st.stop()
+
+    lead_dates = pd.to_datetime(joined["lead_time"], errors="coerce").dt.date
+    marketing_joined_all = joined[
+        lead_dates.ge(marketing_start) & lead_dates.le(marketing_end)
+    ].copy()
+    campaign_spend_view = daily_campaign_spend[
+        daily_campaign_spend["spend_date"].ge(marketing_start)
+        & daily_campaign_spend["spend_date"].le(marketing_end)
+    ].copy()
+    daily_spend_view = daily_spend[
+        daily_spend["date"].ge(marketing_start) & daily_spend["date"].le(marketing_end)
+    ].copy()
+    selected_authoritative_spend = float(daily_spend_view["spend"].sum())
+    spend_data_view = aggregate_campaign_spend(campaign_spend_view, selected_authoritative_spend)
+
+    missing_attr = marketing_joined_all[~marketing_joined_all.attribution_found].copy() if "attribution_found" in marketing_joined_all else marketing_joined_all.iloc[0:0]
     if len(missing_attr):
         st.error(f"{len(missing_attr):,} DoubleTick assignments are missing from the Ad/Meta attribution report.")
     if spend_errors:
         st.warning("Some Google Sheet campaign tabs could not be read: " + " | ".join(spend_errors))
-    campaign_market = campaign_performance(joined, spend_data)
-    total_spend = (
-        float(authoritative_spend)
-        if authoritative_spend is not None
-        else float(campaign_market.spend.sum())
-    )
-    marketing_joined = joined[joined["campaign_name"].fillna("").astype(str).str.strip().ne("")]
+    campaign_market = campaign_performance(marketing_joined_all, spend_data_view)
+    total_spend = selected_authoritative_spend
+    marketing_joined = marketing_joined_all[marketing_joined_all["campaign_name"].fillna("").astype(str).str.strip().ne("")]
     total_leads = int(marketing_joined.shape[0])
     converted_leads = int(marketing_joined.converted.sum())
     total_revenue = float(marketing_joined.order_value.sum())
@@ -509,12 +558,12 @@ with tabs[1]:
     outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
     outcome_kpis[1].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
     st.caption(
-        f"Spend: Meta Report Google Sheet, {SPEND_START_DATE.strftime('%d %b')}–"
-        f"{SPEND_END_DATE.strftime('%d %b %Y')} inclusive · Leads: generated DoubleTick report · "
+        f"Spend: Meta Report Google Sheet, {marketing_start.strftime('%d %b')}–"
+        f"{marketing_end.strftime('%d %b %Y')} inclusive · Leads: generated DoubleTick report · "
         "Orders and revenue: live Google CRM phone matches."
     )
     st.markdown("#### Country-wise marketing performance")
-    country_market = country_performance(joined, spend_data)
+    country_market = country_performance(marketing_joined_all, spend_data_view)
     country_cards = st.columns(4)
     for position, row in enumerate(country_market.itertuples(index=False)):
         with country_cards[position]:
@@ -539,35 +588,45 @@ with tabs[1]:
         },
     )
 
-    st.markdown("#### Daily spend and CPL")
-    daily_market = daily_marketing_performance(joined, daily_spend)
-    daily_chart = make_subplots(specs=[[{"secondary_y": True}]])
-    daily_chart.add_trace(
-        go.Bar(x=daily_market["date"], y=daily_market["spend"], name="Spend (AED)", marker_color="#176b87"),
-        secondary_y=False,
-    )
-    daily_chart.add_trace(
-        go.Scatter(x=daily_market["date"], y=daily_market["cpl"], name="CPL (AED)", mode="lines+markers", line=dict(color="#d4a017", width=3)),
-        secondary_y=True,
-    )
-    daily_chart.update_yaxes(title_text="Spend (AED)", secondary_y=False)
-    daily_chart.update_yaxes(title_text="CPL (AED)", secondary_y=True)
-    daily_chart.update_layout(height=410, margin=dict(l=15, r=15, t=35, b=15), legend_orientation="h")
-    st.plotly_chart(daily_chart, use_container_width=True)
-    st.dataframe(
-        daily_market,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-            "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
-            "leads": st.column_config.NumberColumn("Attributed leads", format="%d"),
-            "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
-            "orders": st.column_config.NumberColumn("Converted orders", format="%d"),
-            "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
-            "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
-        },
-    )
+    st.markdown("#### Daily country-wise and vendor-wise performance")
+    daily_tabs = st.tabs(["Daily by country", "Daily by vendor"])
+    daily_specs = [
+        (daily_tabs[0], "country", ["UAE", "KSA", "QATAR", "BAHRAIN"]),
+        (daily_tabs[1], "vendor", ["Atyaf", "Oud Al Salam", "LPG", "Scent Passion"]),
+    ]
+    for daily_tab, dimension, allowed_values in daily_specs:
+        with daily_tab:
+            daily_breakdown = daily_dimension_performance(
+                marketing_joined_all, campaign_spend_view, dimension
+            )
+            normalized = daily_breakdown[dimension].astype("string").str.upper()
+            allowed_upper = [value.upper() for value in allowed_values]
+            daily_breakdown = daily_breakdown[normalized.isin(allowed_upper)].copy()
+            chosen = st.multiselect(
+                f"Filter {dimension}", allowed_values, default=allowed_values,
+                key=f"daily_{dimension}_filter",
+            )
+            if chosen:
+                daily_breakdown = daily_breakdown[
+                    daily_breakdown[dimension].astype("string").str.upper().isin(
+                        [value.upper() for value in chosen]
+                    )
+                ]
+            st.dataframe(
+                daily_breakdown,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+                    dimension: dimension.title(),
+                    "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
+                    "leads": st.column_config.NumberColumn("Attributed leads", format="%d"),
+                    "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
+                    "orders": st.column_config.NumberColumn("Converted orders", format="%d"),
+                    "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
+                    "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
+                },
+            )
 
     st.markdown("#### Exact campaign performance")
     campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "roas"]
@@ -586,11 +645,11 @@ with tabs[1]:
     fig = px.bar(chart_data, x="campaign_name", y="spend", color="conversion_rate", text="orders", title="Campaign spend and converted orders", color_continuous_scale=["#dceff3","#16856b"])
     fig.update_layout(xaxis_title="", yaxis_title="Spend (AED)", height=430)
     st.plotly_chart(fig, use_container_width=True)
-    view = st.radio("Operational breakdown", ["country", "vendor", "product"], horizontal=True)
-    market = grouped(joined, view)
-    campaign_dimensions = joined[["campaign_name", view]].drop_duplicates()
+    view = st.radio("Operational breakdown", ["country", "vendor"], horizontal=True)
+    market = grouped(marketing_joined_all, view)
+    campaign_dimensions = marketing_joined_all[["campaign_name", view]].drop_duplicates()
     campaign_dimensions["campaign_key"] = campaign_key(campaign_dimensions["campaign_name"])
-    dimension_spend = spend_data.merge(campaign_dimensions[["campaign_key", view]], on="campaign_key", how="left").groupby(view, dropna=False).spend.sum().reset_index()
+    dimension_spend = spend_data_view.merge(campaign_dimensions[["campaign_key", view]], on="campaign_key", how="left").groupby(view, dropna=False).spend.sum().reset_index()
     market = market.merge(dimension_spend, on=view, how="left")
     market["spend"] = market["spend"].fillna(0.0)
     market["cpl"] = market.spend.div(market.leads.replace(0, pd.NA))
