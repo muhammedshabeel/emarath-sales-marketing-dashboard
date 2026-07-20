@@ -35,7 +35,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 15
+ANALYSIS_SCHEMA_VERSION = 16
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -67,7 +67,8 @@ SPEND_TABS = [
 ]
 
 ORDER_SHEET_ID = "1965jh8ovT2piechopznKTHkVRRhathkIxXeV0wczCfY"
-ORDER_START_DATE = date(2026, 7, 1)
+ORDER_START_DATE = date(2026, 7, 4)
+ORDER_END_DATE = date(2026, 7, 18)
 
 
 def campaign_key(value):
@@ -113,7 +114,11 @@ def load_google_campaign_spend(window_end_date):
 @st.cache_data(ttl=300, show_spinner=False)
 def load_google_crm_orders():
     selected_columns = "A,B,C,D,E,G,H,K,M,O,U,V,X,Y"
-    query = f"select {selected_columns} where C >= date '{ORDER_START_DATE.isoformat()}'"
+    query = (
+        f"select {selected_columns} "
+        f"where C >= date '{ORDER_START_DATE.isoformat()}' "
+        f"and C <= date '{ORDER_END_DATE.isoformat()}'"
+    )
     csv_url = (
         f"https://docs.google.com/spreadsheets/d/{ORDER_SHEET_ID}/gviz/tq"
         f"?tqx=out:csv&sheet=CRM&tq={quote(query)}&headers=1"
@@ -371,7 +376,11 @@ with tabs[0]:
     st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
     metrics = st.columns(4)
     metrics[0].metric("Leads", f"{total_leads:,}")
-    metrics[1].metric("Total CRM orders", f"{total_orders:,}", f"Since {ORDER_START_DATE.strftime('%d %b %Y')}")
+    metrics[1].metric(
+        "Total CRM orders",
+        f"{total_orders:,}",
+        f"{ORDER_START_DATE.strftime('%d %b')}–{ORDER_END_DATE.strftime('%d %b %Y')}",
+    )
     metrics[2].metric("Orders from generated leads", f"{lead_orders:,}", f"{lead_orders / total_leads * 100:.1f}% of assigned leads")
     metrics[3].metric("Other-source orders", f"{other_source_orders:,}", f"{other_source_orders / total_orders * 100:.1f}% of orders" if total_orders else None)
     st.markdown('<div class="section-label">Call execution · GCC leads only</div>', unsafe_allow_html=True)
