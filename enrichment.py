@@ -202,6 +202,7 @@ def classify_campaign(name):
     if country == "Unmapped":
         product_country = {
             "AL HUDA": "UAE", "PREMIUM EDITION": "UAE", "DOE": "UAE",
+            "LUMINUX": "UAE", "ARCHER": "KSA",
             "OUD LOVERS": "Bahrain", "ABSOLUTE MOUNTAIN": "KSA",
             "HECTOR": "KSA", "VOLGA": "KSA",
         }
