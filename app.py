@@ -4,9 +4,10 @@ from datetime import date, time, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from urllib.parse import quote
 
-from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_leads, normalize_sales, qa_report
+from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_google_crm_orders, normalize_leads, qa_report
 from data_io import choose_best_sheet, detect_column, read_upload
 from enrichment import generate_fixed_zip_report
 
@@ -32,12 +33,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Sales & Marketing Intelligence")
-st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
+st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 14
+ANALYSIS_SCHEMA_VERSION = 15
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
+    st.session_state.pop("analysis_inputs", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
+
+st_autorefresh(interval=300_000, limit=None, key="google_crm_order_refresh")
 
 
 def secret(name, default=""):
@@ -61,6 +65,9 @@ SPEND_TABS = [
     "Campaign - Emarath", "Campaign - Emarath-Qatar",
     "Campaign - Emarath Global - KSA",
 ]
+
+ORDER_SHEET_ID = "1965jh8ovT2piechopznKTHkVRRhathkIxXeV0wczCfY"
+ORDER_START_DATE = date(2026, 7, 1)
 
 
 def campaign_key(value):
@@ -101,6 +108,26 @@ def load_google_campaign_spend(window_end_date):
     )
     grouped_spend = grouped_spend.rename(columns={"Campaign Name": "campaign_name_spend"})
     return grouped_spend, errors
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_google_crm_orders():
+    selected_columns = "A,B,C,D,E,G,H,K,M,O,U,V,X,Y"
+    query = f"select {selected_columns} where C >= date '{ORDER_START_DATE.isoformat()}'"
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{ORDER_SHEET_ID}/gviz/tq"
+        f"?tqx=out:csv&sheet=CRM&tq={quote(query)}&headers=1"
+    )
+    frame = pd.read_csv(csv_url)
+    required = {
+        "COUNTRY", "AGENT", "DATE", "TRACKING NUM", "EM NUMBER",
+        "NUMBER1", "NUMBER2", "PRODUCT 1", "PRODUCT 2", "VALUE",
+        "VENDOR", "CS STATUS", "REASON", "Customer Path",
+    }
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError("Google CRM columns missing: " + ", ".join(sorted(missing)))
+    return frame
 
 
 def campaign_performance(joined, spend_data):
@@ -186,29 +213,32 @@ with st.sidebar:
     st.subheader("Source timezones")
     tz_options = ["Asia/Dubai", "Asia/Kolkata"]
     dt_tz = st.selectbox("DoubleTick", tz_options, 0, help="Used for lead-time and speed-to-call only. It never removes rows from the DoubleTick upload.")
-    wp_tz = st.selectbox("Workpex", tz_options, 0)
     cx_tz = st.selectbox("3CX", tz_options, 0)
+    st.divider()
+    st.caption("Google CRM orders refresh automatically every five minutes.")
+    if st.button("Refresh orders now", use_container_width=True):
+        load_google_crm_orders.clear()
+        st.rerun()
 
-st.subheader("1. Upload the three source reports")
-c1, c2, c3 = st.columns(3)
+st.subheader("1. Upload the two source reports")
+c1, c2 = st.columns(2)
 dt_file = c1.file_uploader("DoubleTick assignments", type=["csv", "xlsx", "xls", "zip"], help="Customer number + assigned agent number only")
-wp_file = c2.file_uploader("Workpex sales", type=["csv", "xlsx", "xls", "zip"])
-cx_file = c3.file_uploader("3CX calls", type=["csv", "xlsx", "xls", "zip"])
+cx_file = c2.file_uploader("3CX calls", type=["csv", "xlsx", "xls", "zip"])
 
-if not all((dt_file, wp_file, cx_file)):
-    st.info("Upload all three reports. The Ad/Meta attribution report will be generated automatically from the DoubleTick assignments.")
+if not all((dt_file, cx_file)):
+    st.info("Upload DoubleTick and 3CX reports. Orders are read automatically from the live Google CRM sheet.")
     st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel. The app will propose column mappings before processing.")
     st.stop()
 
 try:
-    dt_frames, wp_frames, cx_frames = read_upload(dt_file), read_upload(wp_file), read_upload(cx_file)
+    dt_frames, cx_frames = read_upload(dt_file), read_upload(cx_file)
 except Exception as exc:
     st.error(f"Could not read an upload: {exc}"); st.stop()
 
 st.subheader("2. Confirm sheets and columns")
-tabs = st.tabs(["DoubleTick assignment mapping", "Workpex mapping", "3CX mapping"])
+tabs = st.tabs(["DoubleTick assignment mapping", "3CX mapping"])
 selected = {}
-for tab, name, frames in zip(tabs, ["DoubleTick", "Workpex", "3CX"], [dt_frames, wp_frames, cx_frames]):
+for tab, name, frames in zip(tabs, ["DoubleTick", "3CX"], [dt_frames, cx_frames]):
     with tab:
         best, _ = choose_best_sheet(frames, name.lower())
         sheet = st.selectbox("Report sheet/file", list(frames), index=list(frames).index(best), key=f"sheet_{name}")
@@ -286,7 +316,6 @@ submitted = st.button("Build dashboard", type="primary", use_container_width=Tru
 if submitted:
     with st.spinner("Normalizing and matching reports…"):
         leads = normalize_leads(*selected["DoubleTick"], dt_tz, report_tz)
-        sales = normalize_sales(*selected["Workpex"], wp_tz, report_tz)
         calls = normalize_calls(*selected["3CX"], cx_tz, report_tz)
         agent_crosswalk = agent_directory_frame()
         wabas = ["".join(filter(str.isdigit, x)) for x in secret("DOUBLETICK_WABA_NUMBERS", "971521367907").split(",") if x.strip()]
@@ -301,8 +330,21 @@ if submitted:
     attribution = normalize_attribution(dt_report, {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status", "classification": "classification_text"})
     leads = attach_attribution(leads, attribution)
     bar.empty()
+    st.session_state["analysis_inputs"] = (
+        leads, calls, call_start, call_end, report_tz, streak_gap,
+        filter_calls, agent_crosswalk, dt_report, start_date, end_date,
+    )
+
+if "analysis_inputs" in st.session_state:
+    leads, calls, call_start, call_end, report_tz, streak_gap, filter_calls, agent_crosswalk, dt_report, start_date, end_date = st.session_state["analysis_inputs"]
+    try:
+        crm_raw = load_google_crm_orders()
+    except Exception as exc:
+        st.error(f"Could not refresh Google CRM orders: {exc}")
+        st.stop()
+    sales = normalize_google_crm_orders(crm_raw, dt_report["phone"], report_tz)
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
-    ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Workpex upload": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
+    ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Google CRM orders": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
     spend_data, spend_errors = load_google_campaign_spend(end_date)
     st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors)
@@ -314,22 +356,24 @@ else:
 if joined.empty:
     st.error("The DoubleTick upload contains no usable lead rows."); st.stop()
 
-if len({dt_tz, wp_tz, cx_tz}) > 1:
+if len({dt_tz, cx_tz}) > 1:
     st.warning("Source timezones differ. Times were converted to the selected report timezone; verify those source timezone selections.")
 
 st.markdown(f"""<div class="hero"><h2>Performance command centre</h2><p>{len(joined):,} assigned leads · {pd.Timestamp(call_start).strftime('%d %b, %I:%M %p')} to {pd.Timestamp(call_end).strftime('%d %b, %I:%M %p')} · Dubai time</p></div>""", unsafe_allow_html=True)
 tabs = st.tabs(["Overview", "Marketing", "Sales", "3CX calls", "Agent scorecards", "Data quality"])
 
 with tabs[0]:
-    total_leads, total_orders = len(joined), int(joined.order_count.sum())
+    total_leads, total_orders = len(joined), len(orders)
+    lead_orders = int(orders.order_from_generated_lead.sum())
+    other_source_orders = total_orders - lead_orders
     gcc_leads = joined[joined.lead_region.eq("GCC")]
     other_leads = joined[joined.lead_region.eq("Other country")]
     st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
     metrics = st.columns(4)
     metrics[0].metric("Leads", f"{total_leads:,}")
-    metrics[1].metric("Orders", f"{total_orders:,}")
-    metrics[2].metric("Conversion", f"{total_orders / total_leads * 100:.1f}%")
-    metrics[3].metric("Workpex matched", f"{joined.workpex_found.sum():,}", f"{joined.workpex_found.mean()*100:.1f}% coverage")
+    metrics[1].metric("Total CRM orders", f"{total_orders:,}", f"Since {ORDER_START_DATE.strftime('%d %b %Y')}")
+    metrics[2].metric("Orders from generated leads", f"{lead_orders:,}", f"{lead_orders / total_leads * 100:.1f}% of assigned leads")
+    metrics[3].metric("Other-source orders", f"{other_source_orders:,}", f"{other_source_orders / total_orders * 100:.1f}% of orders" if total_orders else None)
     st.markdown('<div class="section-label">Call execution · GCC leads only</div>', unsafe_allow_html=True)
     call_metrics = st.columns(4)
     call_metrics[0].metric("GCC assigned", f"{len(gcc_leads):,}")
@@ -373,8 +417,8 @@ with tabs[1]:
     outcome_kpis = st.columns(3)
     outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
     outcome_kpis[1].metric("Cost per order", f"AED {total_spend / converted_leads:,.2f}" if converted_leads else "N/A")
-    outcome_kpis[2].metric("Workpex revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
-    st.caption(f"Spend only: Google Sheet · Window ending {end_date.strftime('%d %b %Y')}. Leads: generated DoubleTick report. Orders and revenue: Workpex.")
+    outcome_kpis[2].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
+    st.caption(f"Spend: campaign-spend Google Sheet · Leads: generated DoubleTick report · Orders and revenue: live Google CRM phone matches.")
     st.markdown("#### Exact campaign performance")
     campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "cost_per_order", "roas"]
     st.dataframe(campaign_market[campaign_columns], hide_index=True, use_container_width=True, column_config={
@@ -423,17 +467,21 @@ with tabs[1]:
 with tabs[2]:
     missing_wp = joined[~joined.workpex_found].copy()
     multiple_wp = joined[joined.workpex_match_count.gt(1)].copy()
-    if len(missing_wp):
-        st.error(f"{len(missing_wp):,} DoubleTick leads are missing from Workpex in the detected reporting period.")
-    else:
-        st.success("Every DoubleTick lead appears in Workpex.")
-    st.markdown("#### DoubleTick → Workpex reconciliation")
+    st.markdown("#### Live Google CRM order attribution")
+    order_metrics = st.columns(3)
+    order_metrics[0].metric("Total orders", f"{len(orders):,}")
+    order_metrics[1].metric("Orders from generated leads", f"{int(orders.order_from_generated_lead.sum()):,}")
+    order_metrics[2].metric("Other-source orders", f"{int((~orders.order_from_generated_lead).sum()):,}")
+    source_breakdown = orders.groupby("order_source", dropna=False).size().rename("orders").reset_index().sort_values("orders", ascending=False)
+    st.dataframe(source_breakdown, hide_index=True, use_container_width=True)
+    st.caption("Customer Path is used only when NUMBER1 and NUMBER2 do not match the current generated DoubleTick phone list.")
+    st.markdown("#### DoubleTick lead → Google CRM reconciliation")
     reconciliation = joined.workpex_reconciliation.value_counts().rename_axis("result").reset_index(name="leads")
     st.dataframe(reconciliation, hide_index=True, use_container_width=True)
-    st.markdown("#### Missing from Workpex")
+    st.markdown("#### Leads without a matching CRM order")
     st.dataframe(missing_wp[["lead_phone", "lead_time", "agent", "agent_number", "campaign_name", "country", "product"]], hide_index=True, use_container_width=True)
     if len(multiple_wp):
-        st.warning(f"{len(multiple_wp):,} DoubleTick leads matched multiple Workpex rows. Review before treating row counts as unique orders.")
+        st.info(f"{len(multiple_wp):,} DoubleTick leads generated more than one unique Google CRM order.")
     sales_view = grouped(joined, "order_products") if "order_products" in joined else pd.DataFrame()
     st.dataframe(sales_view, hide_index=True, use_container_width=True)
     st.markdown("#### Converted order detail")
@@ -466,46 +514,47 @@ with tabs[3]:
         st.dataframe(other_lead_detail, hide_index=True, use_container_width=True)
 
 with tabs[4]:
-    agents = grouped(joined, "agent")
-    agents = agents.rename(columns={"orders": "orders_from_doubletick_leads"})
-    workpex_converted = orders.groupby("sales_agent", dropna=False).size().rename("workpex_converted").astype(int)
-    agent_names = sorted(set(joined.agent.dropna().astype(str)) | set(workpex_converted.index.astype(str)))
+    total_by_agent = orders.groupby("sales_agent", dropna=False).size().rename("total_orders").astype(int)
+    lead_by_agent = orders[orders.order_from_generated_lead].groupby("sales_agent", dropna=False).size().rename("lead_orders").astype(int)
+    other_by_agent = orders[~orders.order_from_generated_lead].groupby("sales_agent", dropna=False).size().rename("other_orders").astype(int)
+    agent_names = sorted(set(joined.agent.dropna().astype(str)) | set(total_by_agent.index.astype(str)))
     agent_cards = []
     for agent_name in agent_names:
         agent_rows = joined[joined.agent.eq(agent_name)]
         agent_gcc = agent_rows[agent_rows.lead_region.eq("GCC")]
         assigned = len(agent_rows)
-        converted = int(workpex_converted.get(agent_name, 0))
-        agent_cards.append({"agent": agent_name, "assigned": assigned, "converted": converted,
-                            "conversion": converted / assigned * 100 if assigned else 0.0,
+        total_agent_orders = int(total_by_agent.get(agent_name, 0))
+        lead_agent_orders = int(lead_by_agent.get(agent_name, 0))
+        other_agent_orders = int(other_by_agent.get(agent_name, 0))
+        agent_cards.append({"agent": agent_name, "assigned": assigned, "total_orders": total_agent_orders,
+                            "lead_orders": lead_agent_orders, "other_orders": other_agent_orders,
+                            "conversion": lead_agent_orders / assigned * 100 if assigned else 0.0,
                             "answered": int(agent_gcc.answered_any.sum()),
                             "not_dialed": int((~agent_gcc.called).sum()),
                             "coverage": agent_gcc.called.mean() * 100 if len(agent_gcc) else 0})
-    agent_cards = pd.DataFrame(agent_cards).sort_values(["converted", "conversion"], ascending=False)
+    agent_cards = pd.DataFrame(agent_cards).sort_values(["lead_orders", "total_orders"], ascending=False)
     st.markdown('<div class="section-label">Team leaderboard</div>', unsafe_allow_html=True)
-    leaderboard = px.bar(agent_cards, x="agent", y="converted", color="conversion", text="converted", title="Converted leads by assigned agent", color_continuous_scale=["#dceff3","#16856b"])
-    leaderboard.update_layout(xaxis_title="",yaxis_title="Converted leads",height=390,margin=dict(l=15,r=15,t=55,b=15))
+    leaderboard_data = agent_cards.melt(id_vars="agent", value_vars=["lead_orders", "other_orders"], var_name="source", value_name="orders")
+    leaderboard_data["source"] = leaderboard_data["source"].map({"lead_orders": "Generated leads", "other_orders": "Other sources"})
+    leaderboard = px.bar(leaderboard_data, x="agent", y="orders", color="source", text="orders", title="Google CRM orders by agent and verified source", color_discrete_map={"Generated leads":"#16856b","Other sources":"#d4a017"})
+    leaderboard.update_layout(xaxis_title="",yaxis_title="Orders",height=420,margin=dict(l=15,r=15,t=55,b=15),barmode="stack")
     st.plotly_chart(leaderboard, use_container_width=True)
     st.markdown('<div class="section-label">Individual agent cards</div>', unsafe_allow_html=True)
     card_columns = st.columns(3)
     for position, row in enumerate(agent_cards.itertuples(index=False)):
         agent_rows = joined[joined.agent.eq(row.agent)]
         with card_columns[position % 3]:
-            st.markdown(f'''<div class="agent-card"><div class="agent-name">👤 {row.agent}</div><div class="agent-sub">Dynamic metrics from current uploads</div><div class="agent-grid"><div class="agent-kpi"><b>{row.assigned:,}</b><span>DoubleTick assigned</span></div><div class="agent-kpi"><b class="good">{row.converted:,}</b><span>Workpex converted</span></div><div class="agent-kpi"><b>{row.answered:,}</b><span>Answered GCC</span></div><div class="agent-kpi"><b class="risk">{row.not_dialed:,}</b><span>Not dialed GCC</span></div></div></div>''', unsafe_allow_html=True)
+            st.markdown(f'''<div class="agent-card"><div class="agent-name">👤 {row.agent}</div><div class="agent-sub">Live Google CRM + current generated lead report</div><div class="agent-grid"><div class="agent-kpi"><b>{row.assigned:,}</b><span>DoubleTick assigned</span></div><div class="agent-kpi"><b>{row.total_orders:,}</b><span>Total orders</span></div><div class="agent-kpi"><b class="good">{row.lead_orders:,}</b><span>Orders from leads</span></div><div class="agent-kpi"><b>{row.other_orders:,}</b><span>Other-source orders</span></div><div class="agent-kpi"><b>{row.answered:,}</b><span>Answered GCC</span></div><div class="agent-kpi"><b class="risk">{row.not_dialed:,}</b><span>Not dialed GCC</span></div></div></div>''', unsafe_allow_html=True)
             st.progress(min(max(row.coverage / 100, 0), 1), text=f"Call coverage {row.coverage:.1f}%")
             with st.expander("View assigned lead details"):
                 detail_cols = [column for column in ["lead_phone","country","product","called","answered_any","converted","order_count"] if column in agent_rows]
                 st.dataframe(agent_rows[detail_cols], hide_index=True, use_container_width=True)
-            with st.expander("View Workpex converted rows"):
+            with st.expander("View Google CRM orders"):
                 converted_rows = orders[orders.sales_agent.eq(row.agent)]
-                converted_cols = [column for column in ["phone_key", "sales_agent", "order_status", "sale_time", "order_id", "order_product", "order_amount"] if column in converted_rows]
+                converted_cols = [column for column in ["order_id", "sale_time", "sales_agent", "order_source", "order_from_generated_lead", "matched_lead_phone", "customer_path", "order_status", "order_product", "order_amount"] if column in converted_rows]
                 st.dataframe(converted_rows[converted_cols], hide_index=True, use_container_width=True)
     st.markdown('<div class="section-label">Full team comparison</div>', unsafe_allow_html=True)
-    agents = agents.merge(workpex_converted.reset_index(), left_on="agent", right_on="sales_agent", how="outer")
-    agents["agent"] = agents["agent"].fillna(agents["sales_agent"])
-    agents["workpex_converted"] = agents["workpex_converted"].fillna(0).astype(int)
-    agents = agents.drop(columns=["sales_agent"]).sort_values("workpex_converted", ascending=False)
-    st.dataframe(agents, hide_index=True, use_container_width=True, column_config={"conversion_rate": st.column_config.ProgressColumn("DoubleTick-lead conversion %", min_value=0, max_value=100, format="%.1f%%"), "call_coverage": st.column_config.ProgressColumn("Call coverage %", min_value=0, max_value=100, format="%.1f%%"), "workpex_converted": st.column_config.NumberColumn("Workpex converted", format="%d")})
+    st.dataframe(agent_cards, hide_index=True, use_container_width=True, column_config={"conversion": st.column_config.ProgressColumn("Lead conversion %", min_value=0, max_value=100, format="%.1f%%"), "coverage": st.column_config.ProgressColumn("Call coverage %", min_value=0, max_value=100, format="%.1f%%")})
 
 with tabs[5]:
     st.markdown("#### Detected source ranges")
@@ -526,7 +575,7 @@ agent_report = grouped(joined, "agent")
 marketing_report = campaign_performance(joined, spend_data)
 missing_workpex = joined[~joined.workpex_found].copy()
 missing_attribution = joined[~joined.attribution_found].copy() if "attribution_found" in joined else joined.iloc[0:0]
-download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Missing_From_Workpex": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing_Performance": marketing_report, "Google_Sheet_Spend": spend_data, "Orders": orders, "Calls": calls_in_window, "QA": qa})
+download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Leads_Without_CRM_Order": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing_Performance": marketing_report, "Google_Sheet_Spend": spend_data, "Google_CRM_Orders": orders, "Calls": calls_in_window, "QA": qa})
 window_name = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}"
 st.download_button("Download complete analysis (.xlsx)", download, file_name=f"sales_marketing_analysis_{window_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 
