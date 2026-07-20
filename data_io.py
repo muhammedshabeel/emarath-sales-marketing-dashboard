@@ -93,7 +93,7 @@ def phone_digits(series):
     # floats. Converting those values directly to strings adds `.0`, which
     # would incorrectly turn 918089262612 into 9180892626120. Normalize
     # integer-like numeric values first, including scientific notation.
-    values = series.fillna("").astype("string").str.strip()
+    values = series.astype("string").fillna("").str.strip()
     numeric = pd.to_numeric(values, errors="coerce")
     integer_like = numeric.notna() & numeric.mod(1).eq(0)
     values.loc[integer_like] = numeric.loc[integer_like].map(lambda value: f"{value:.0f}")
