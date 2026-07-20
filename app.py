@@ -34,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 13
+ANALYSIS_SCHEMA_VERSION = 14
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -467,14 +467,17 @@ with tabs[3]:
 
 with tabs[4]:
     agents = grouped(joined, "agent")
-    agents = agents.sort_values(["orders","conversion_rate"], ascending=False)
+    agents = agents.rename(columns={"orders": "orders_from_doubletick_leads"})
+    workpex_converted = orders.groupby("sales_agent", dropna=False).size().rename("workpex_converted").astype(int)
+    agent_names = sorted(set(joined.agent.dropna().astype(str)) | set(workpex_converted.index.astype(str)))
     agent_cards = []
-    for agent_name, agent_rows in joined.groupby("agent", dropna=False):
+    for agent_name in agent_names:
+        agent_rows = joined[joined.agent.eq(agent_name)]
         agent_gcc = agent_rows[agent_rows.lead_region.eq("GCC")]
         assigned = len(agent_rows)
-        converted = int(agent_rows.converted.sum())
+        converted = int(workpex_converted.get(agent_name, 0))
         agent_cards.append({"agent": agent_name, "assigned": assigned, "converted": converted,
-                            "conversion": converted / assigned * 100 if assigned else 0,
+                            "conversion": converted / assigned * 100 if assigned else 0.0,
                             "answered": int(agent_gcc.answered_any.sum()),
                             "not_dialed": int((~agent_gcc.called).sum()),
                             "coverage": agent_gcc.called.mean() * 100 if len(agent_gcc) else 0})
@@ -488,13 +491,21 @@ with tabs[4]:
     for position, row in enumerate(agent_cards.itertuples(index=False)):
         agent_rows = joined[joined.agent.eq(row.agent)]
         with card_columns[position % 3]:
-            st.markdown(f'''<div class="agent-card"><div class="agent-name">👤 {row.agent}</div><div class="agent-sub">Assigned lead owner</div><div class="agent-grid"><div class="agent-kpi"><b>{row.assigned:,}</b><span>Assigned leads</span></div><div class="agent-kpi"><b class="good">{row.converted:,}</b><span>Converted · {row.conversion:.1f}%</span></div><div class="agent-kpi"><b>{row.answered:,}</b><span>Answered GCC</span></div><div class="agent-kpi"><b class="risk">{row.not_dialed:,}</b><span>Not dialed GCC</span></div></div></div>''', unsafe_allow_html=True)
+            st.markdown(f'''<div class="agent-card"><div class="agent-name">👤 {row.agent}</div><div class="agent-sub">Dynamic metrics from current uploads</div><div class="agent-grid"><div class="agent-kpi"><b>{row.assigned:,}</b><span>DoubleTick assigned</span></div><div class="agent-kpi"><b class="good">{row.converted:,}</b><span>Workpex converted</span></div><div class="agent-kpi"><b>{row.answered:,}</b><span>Answered GCC</span></div><div class="agent-kpi"><b class="risk">{row.not_dialed:,}</b><span>Not dialed GCC</span></div></div></div>''', unsafe_allow_html=True)
             st.progress(min(max(row.coverage / 100, 0), 1), text=f"Call coverage {row.coverage:.1f}%")
             with st.expander("View assigned lead details"):
                 detail_cols = [column for column in ["lead_phone","country","product","called","answered_any","converted","order_count"] if column in agent_rows]
                 st.dataframe(agent_rows[detail_cols], hide_index=True, use_container_width=True)
+            with st.expander("View Workpex converted rows"):
+                converted_rows = orders[orders.sales_agent.eq(row.agent)]
+                converted_cols = [column for column in ["phone_key", "sales_agent", "order_status", "sale_time", "order_id", "order_product", "order_amount"] if column in converted_rows]
+                st.dataframe(converted_rows[converted_cols], hide_index=True, use_container_width=True)
     st.markdown('<div class="section-label">Full team comparison</div>', unsafe_allow_html=True)
-    st.dataframe(agents, hide_index=True, use_container_width=True, column_config={"conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"), "call_coverage": st.column_config.ProgressColumn("Call coverage %", min_value=0, max_value=100, format="%.1f%%")})
+    agents = agents.merge(workpex_converted.reset_index(), left_on="agent", right_on="sales_agent", how="outer")
+    agents["agent"] = agents["agent"].fillna(agents["sales_agent"])
+    agents["workpex_converted"] = agents["workpex_converted"].fillna(0).astype(int)
+    agents = agents.drop(columns=["sales_agent"]).sort_values("workpex_converted", ascending=False)
+    st.dataframe(agents, hide_index=True, use_container_width=True, column_config={"conversion_rate": st.column_config.ProgressColumn("DoubleTick-lead conversion %", min_value=0, max_value=100, format="%.1f%%"), "call_coverage": st.column_config.ProgressColumn("Call coverage %", min_value=0, max_value=100, format="%.1f%%"), "workpex_converted": st.column_config.NumberColumn("Workpex converted", format="%d")})
 
 with tabs[5]:
     st.markdown("#### Detected source ranges")
