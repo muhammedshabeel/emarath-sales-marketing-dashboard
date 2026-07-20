@@ -34,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 12
+ANALYSIS_SCHEMA_VERSION = 13
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -366,13 +366,14 @@ with tabs[1]:
     total_leads = int(marketing_joined.shape[0])
     converted_leads = int(marketing_joined.converted.sum())
     total_revenue = float(marketing_joined.order_value.sum())
-    k = st.columns(6)
-    k[0].metric("Meta spend", f"AED {total_spend:,.2f}")
-    k[1].metric("Attributed leads", f"{total_leads:,}")
-    k[2].metric("Cost per lead", f"AED {total_spend / total_leads:,.2f}" if total_leads else "N/A")
-    k[3].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
-    k[4].metric("Cost per order", f"AED {total_spend / converted_leads:,.2f}" if converted_leads else "N/A")
-    k[5].metric("Workpex revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
+    primary_kpis = st.columns(3)
+    primary_kpis[0].metric("Meta spend", f"AED {total_spend:,.2f}")
+    primary_kpis[1].metric("Attributed leads", f"{total_leads:,}")
+    primary_kpis[2].metric("Cost per lead", f"AED {total_spend / total_leads:,.2f}" if total_leads else "N/A")
+    outcome_kpis = st.columns(3)
+    outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
+    outcome_kpis[1].metric("Cost per order", f"AED {total_spend / converted_leads:,.2f}" if converted_leads else "N/A")
+    outcome_kpis[2].metric("Workpex revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
     st.caption(f"Spend only: Google Sheet · Window ending {end_date.strftime('%d %b %Y')}. Leads: generated DoubleTick report. Orders and revenue: Workpex.")
     st.markdown("#### Exact campaign performance")
     campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "cost_per_order", "roas"]
