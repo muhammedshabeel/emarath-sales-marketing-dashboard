@@ -35,7 +35,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 24
+ANALYSIS_SCHEMA_VERSION = 25
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -596,48 +596,48 @@ with tabs[1]:
         },
     )
 
-    st.markdown("#### Daily vendor spend and CPR")
-    st.caption("Spend comes only from the Meta spend sheet. Results are attributed DoubleTick leads; CPR = spend ÷ results.")
-    vendors = ["Atyaf", "Oud Al Salam", "LPG", "Scent Passion"]
-    daily_vendor = daily_dimension_performance(
-        date_filtered_joined, campaign_spend_view, "vendor"
+    st.markdown("#### Daily country spend and CPR")
+    st.caption("Spend comes only from the Meta reporting sheet. Leads come only from the uploaded DoubleTick report; CPR = spend ÷ leads.")
+    countries = ["UAE", "KSA", "QATAR", "BAHRAIN"]
+    daily_country = daily_dimension_performance(
+        date_filtered_joined, campaign_spend_view, "country"
     )
-    daily_vendor = daily_vendor[
-        daily_vendor["vendor"].astype("string").str.upper().isin(
-            [vendor.upper() for vendor in vendors]
+    daily_country = daily_country[
+        daily_country["country"].astype("string").str.upper().isin(
+            countries
         )
     ].copy()
-    daily_vendor = daily_vendor.rename(columns={"leads": "results", "cpl": "cpr"})
-    selected_vendors = st.multiselect(
-        "Filter vendor", vendors, default=vendors, key="daily_vendor_cpr_filter"
+    daily_country = daily_country.rename(columns={"cpl": "cpr"})
+    selected_countries = st.multiselect(
+        "Filter country", countries, default=countries, key="daily_country_cpr_filter"
     )
-    if selected_vendors:
-        daily_vendor = daily_vendor[
-            daily_vendor["vendor"].astype("string").str.upper().isin(
-                [vendor.upper() for vendor in selected_vendors]
+    if selected_countries:
+        daily_country = daily_country[
+            daily_country["country"].astype("string").str.upper().isin(
+                selected_countries
             )
         ]
-    vendor_chart = px.bar(
-        daily_vendor,
+    country_chart = px.bar(
+        daily_country,
         x="date",
         y="spend",
-        color="vendor",
+        color="country",
         barmode="group",
         text_auto=".2s",
-        title="Daily vendor spend",
-        labels={"date": "Date", "spend": "Spend (AED)", "vendor": "Vendor"},
+        title="Daily country spend",
+        labels={"date": "Date", "spend": "Spend (AED)", "country": "Country"},
     )
-    vendor_chart.update_layout(height=410, xaxis_title="", yaxis_title="Spend (AED)")
-    st.plotly_chart(vendor_chart, use_container_width=True)
+    country_chart.update_layout(height=410, xaxis_title="", yaxis_title="Spend (AED)")
+    st.plotly_chart(country_chart, use_container_width=True)
     st.dataframe(
-        daily_vendor[["date", "vendor", "spend", "results", "cpr"]],
+        daily_country[["date", "country", "spend", "leads", "cpr"]],
         hide_index=True,
         use_container_width=True,
         column_config={
             "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-            "vendor": "Vendor",
+            "country": "Country",
             "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
-            "results": st.column_config.NumberColumn("Results", format="%d"),
+            "leads": st.column_config.NumberColumn("Uploaded leads", format="%d"),
             "cpr": st.column_config.NumberColumn("CPR (AED)", format="%.2f"),
         },
     )
