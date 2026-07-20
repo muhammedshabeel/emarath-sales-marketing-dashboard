@@ -21,8 +21,8 @@ def normalize_leads(df, mapping, source_tz, report_tz):
     gcc_prefixes = ("971", "973", "974", "966", "996")
     out["lead_region"] = lead_digits.map(lambda value: "GCC" if str(value).startswith(gcc_prefixes) else "Other country")
     out["lead_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
-    out["agent_number"] = df[mapping["agent_number"]].fillna("").astype(str) if mapping.get("agent_number") else ""
-    agent_digits = phone_digits(out.agent_number)
+    agent_digits = phone_digits(df[mapping["agent_number"]]) if mapping.get("agent_number") else pd.Series("", index=df.index, dtype="string")
+    out["agent_number"] = agent_digits
     out["agent"] = agent_digits.map(AGENT_PHONE_NAME).fillna("UNMAPPED AGENT")
     out["ad_id"] = ""
     out["campaign_name"] = ""
