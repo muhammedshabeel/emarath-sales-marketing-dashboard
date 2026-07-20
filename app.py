@@ -35,7 +35,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 23
+ANALYSIS_SCHEMA_VERSION = 24
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -495,7 +495,7 @@ with tabs[0]:
     call_metrics[1].metric("Called", f"{gcc_leads.called.sum():,}", f"{gcc_leads.called.mean()*100:.1f}% coverage")
     call_metrics[2].metric("Answered", f"{gcc_leads.answered_any.sum():,}", f"{gcc_leads.answered_any.mean()*100:.1f}% of GCC leads")
     call_metrics[3].metric("Never called", f"{(~gcc_leads.called).sum():,}", f"{(~gcc_leads.called).mean()*100:.1f}% requires action", delta_color="inverse")
-    funnel = pd.DataFrame({"stage":["Assigned leads","GCC leads","Called GCC leads","Answered GCC leads","Converted leads"],"leads":[len(joined),len(gcc_leads),int(gcc_leads.called.sum()),int(gcc_leads.answered_any.sum()),int(joined.converted.sum())]})
+    funnel = pd.DataFrame({"stage":["Assigned leads","GCC leads","Called GCC leads","Answered GCC leads","Converted orders"],"leads":[len(joined),len(gcc_leads),int(gcc_leads.called.sum()),int(gcc_leads.answered_any.sum()),lead_orders]})
     left, right = st.columns([1.45, 1])
     with left:
         fig = px.funnel(funnel, x="leads", y="stage", title="Lead-to-order journey", color="stage", color_discrete_sequence=["#176b87","#2389a8","#42a5b8","#7bc5ca","#d4a017"])
@@ -554,14 +554,15 @@ with tabs[1]:
     # Never remove its rows with the marketing spend date selector.
     marketing_joined = doubletick_report
     total_leads = int(marketing_joined.shape[0])
-    converted_leads = int(marketing_joined.converted.sum())
-    total_revenue = float(marketing_joined.order_value.sum())
+    matched_orders = orders[orders.order_from_generated_lead].copy()
+    converted_leads = int(len(matched_orders))
+    total_revenue = float(pd.to_numeric(matched_orders["order_amount"], errors="coerce").fillna(0).sum())
     primary_kpis = st.columns(3)
     primary_kpis[0].metric("Meta spend", f"AED {total_spend:,.2f}")
     primary_kpis[1].metric("DoubleTick leads", f"{total_leads:,}")
     primary_kpis[2].metric("Cost per lead", f"AED {total_spend / total_leads:,.2f}" if total_leads else "N/A")
     outcome_kpis = st.columns(2)
-    outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
+    outcome_kpis[0].metric("Converted orders", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
     outcome_kpis[1].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
     st.caption(
         f"Spend: Meta Report Google Sheet, {marketing_start.strftime('%d %b')}–"
@@ -595,87 +596,51 @@ with tabs[1]:
         },
     )
 
-    st.markdown("#### Daily country-wise and vendor-wise performance")
-    daily_tabs = st.tabs(["Daily by country", "Daily by vendor"])
-    daily_specs = [
-        (daily_tabs[0], "country", ["UAE", "KSA", "QATAR", "BAHRAIN"]),
-        (daily_tabs[1], "vendor", ["Atyaf", "Oud Al Salam", "LPG", "Scent Passion"]),
-    ]
-    for daily_tab, dimension, allowed_values in daily_specs:
-        with daily_tab:
-            daily_breakdown = daily_dimension_performance(
-                date_filtered_joined, campaign_spend_view, dimension
+    st.markdown("#### Daily vendor spend and CPR")
+    st.caption("Spend comes only from the Meta spend sheet. Results are attributed DoubleTick leads; CPR = spend ÷ results.")
+    vendors = ["Atyaf", "Oud Al Salam", "LPG", "Scent Passion"]
+    daily_vendor = daily_dimension_performance(
+        date_filtered_joined, campaign_spend_view, "vendor"
+    )
+    daily_vendor = daily_vendor[
+        daily_vendor["vendor"].astype("string").str.upper().isin(
+            [vendor.upper() for vendor in vendors]
+        )
+    ].copy()
+    daily_vendor = daily_vendor.rename(columns={"leads": "results", "cpl": "cpr"})
+    selected_vendors = st.multiselect(
+        "Filter vendor", vendors, default=vendors, key="daily_vendor_cpr_filter"
+    )
+    if selected_vendors:
+        daily_vendor = daily_vendor[
+            daily_vendor["vendor"].astype("string").str.upper().isin(
+                [vendor.upper() for vendor in selected_vendors]
             )
-            normalized = daily_breakdown[dimension].astype("string").str.upper()
-            allowed_upper = [value.upper() for value in allowed_values]
-            daily_breakdown = daily_breakdown[normalized.isin(allowed_upper)].copy()
-            chosen = st.multiselect(
-                f"Filter {dimension}", allowed_values, default=allowed_values,
-                key=f"daily_{dimension}_filter",
-            )
-            if chosen:
-                daily_breakdown = daily_breakdown[
-                    daily_breakdown[dimension].astype("string").str.upper().isin(
-                        [value.upper() for value in chosen]
-                    )
-                ]
-            st.dataframe(
-                daily_breakdown,
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-                    dimension: dimension.title(),
-                    "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
-                    "leads": st.column_config.NumberColumn("Attributed leads", format="%d"),
-                    "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
-                    "orders": st.column_config.NumberColumn("Converted orders", format="%d"),
-                    "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
-                    "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
-                },
-            )
-
-    st.markdown("#### Exact campaign performance")
-    campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "roas"]
-    st.dataframe(campaign_market[campaign_columns], hide_index=True, use_container_width=True, column_config={
-        "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
-        "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
-        "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
-        "conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"),
-        "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
-    })
-    chart_data = campaign_market[campaign_market.spend.gt(0)].head(20).copy()
-    chart_data["campaign_name"] = chart_data["campaign_name"].fillna("Unmatched spend campaign").astype(str)
-    chart_data["spend"] = pd.to_numeric(chart_data["spend"], errors="coerce").fillna(0.0).astype(float)
-    chart_data["conversion_rate"] = pd.to_numeric(chart_data["conversion_rate"], errors="coerce").fillna(0.0).astype(float)
-    chart_data["orders"] = pd.to_numeric(chart_data["orders"], errors="coerce").fillna(0).astype(int)
-    fig = px.bar(chart_data, x="campaign_name", y="spend", color="conversion_rate", text="orders", title="Campaign spend and converted orders", color_continuous_scale=["#dceff3","#16856b"])
-    fig.update_layout(xaxis_title="", yaxis_title="Spend (AED)", height=430)
-    st.plotly_chart(fig, use_container_width=True)
-    view = st.radio("Operational breakdown", ["country", "vendor"], horizontal=True)
-    market = grouped(doubletick_report, view)
-    campaign_dimensions = doubletick_report[["campaign_name", view]].drop_duplicates()
-    campaign_dimensions["campaign_key"] = campaign_key(campaign_dimensions["campaign_name"])
-    dimension_spend = spend_data_view.merge(campaign_dimensions[["campaign_key", view]], on="campaign_key", how="left").groupby(view, dropna=False).spend.sum().reset_index()
-    market = market.merge(dimension_spend, on=view, how="left")
-    market["spend"] = market["spend"].fillna(0.0)
-    market["cpl"] = market.spend.div(market.leads.replace(0, pd.NA))
-    st.dataframe(market, hide_index=True, use_container_width=True, column_config={
-        "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
-        "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
-        "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
-    })
-    st.markdown("#### Attribution/classification exceptions")
-    country_values = joined["country"] if "country" in joined else pd.Series("Unmapped", index=joined.index)
-    product_values = joined["product"] if "product" in joined else pd.Series("Unmapped", index=joined.index)
-    exception_mask = country_values.eq("Unmapped") | product_values.eq("Unmapped")
-    exception_columns = [column for column in ["lead_phone", "ad_id", "campaign_name", "attribution_status", "country", "product", "vendor"] if column in joined.columns]
-    exceptions = joined.loc[exception_mask, exception_columns].copy()
-    if exceptions.empty:
-        st.success("Every generated campaign was classified.")
-    else:
-        st.warning(f"{len(exceptions):,} leads could not be fully classified. The campaign name and attribution status below show the exact reason.")
-        st.dataframe(exceptions, hide_index=True, use_container_width=True)
+        ]
+    vendor_chart = px.bar(
+        daily_vendor,
+        x="date",
+        y="spend",
+        color="vendor",
+        barmode="group",
+        text_auto=".2s",
+        title="Daily vendor spend",
+        labels={"date": "Date", "spend": "Spend (AED)", "vendor": "Vendor"},
+    )
+    vendor_chart.update_layout(height=410, xaxis_title="", yaxis_title="Spend (AED)")
+    st.plotly_chart(vendor_chart, use_container_width=True)
+    st.dataframe(
+        daily_vendor[["date", "vendor", "spend", "results", "cpr"]],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+            "vendor": "Vendor",
+            "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
+            "results": st.column_config.NumberColumn("Results", format="%d"),
+            "cpr": st.column_config.NumberColumn("CPR (AED)", format="%.2f"),
+        },
+    )
 
 with tabs[2]:
     missing_wp = joined[~joined.workpex_found].copy()
