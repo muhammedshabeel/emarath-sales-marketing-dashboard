@@ -35,7 +35,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 16
+ANALYSIS_SCHEMA_VERSION = 17
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -69,6 +69,8 @@ SPEND_TABS = [
 ORDER_SHEET_ID = "1965jh8ovT2piechopznKTHkVRRhathkIxXeV0wczCfY"
 ORDER_START_DATE = date(2026, 7, 4)
 ORDER_END_DATE = date(2026, 7, 18)
+SPEND_START_DATE = date(2026, 7, 4)
+SPEND_END_DATE = date(2026, 7, 18)
 
 
 def campaign_key(value):
@@ -76,7 +78,7 @@ def campaign_key(value):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_google_campaign_spend(window_end_date):
+def load_google_campaign_spend(window_start_date, window_end_date):
     frames = []
     errors = []
     for tab in SPEND_TABS:
@@ -91,7 +93,8 @@ def load_google_campaign_spend(window_end_date):
                 errors.append(f"{tab}: required spend columns missing")
                 continue
             dates = pd.to_datetime(frame["Window End Date (Dubai)"], errors="coerce").dt.date
-            frame = frame.loc[dates.eq(window_end_date), ["Campaign Name", "Campaign ID", "Spend"]].copy()
+            in_window = dates.ge(window_start_date) & dates.le(window_end_date)
+            frame = frame.loc[in_window, ["Campaign Name", "Campaign ID", "Spend"]].copy()
             if frame.empty:
                 continue
             frame["Spend"] = pd.to_numeric(frame["Spend"], errors="coerce").fillna(0.0)
@@ -99,8 +102,21 @@ def load_google_campaign_spend(window_end_date):
             frames.append(frame)
         except Exception as exc:
             errors.append(f"{tab}: {str(exc)[:120]}")
+    summary_url = (
+        f"https://docs.google.com/spreadsheets/d/{SPEND_SHEET_ID}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote('Meta Report (5pm-5pm)')}"
+    )
+    authoritative_total = None
+    try:
+        summary = pd.read_csv(summary_url)
+        summary_dates = pd.to_datetime(summary["Window End Date (Dubai)"], errors="coerce").dt.date
+        summary_window = summary_dates.ge(window_start_date) & summary_dates.le(window_end_date)
+        authoritative_total = float(pd.to_numeric(summary.loc[summary_window, "Spend"], errors="coerce").fillna(0).sum())
+    except Exception as exc:
+        errors.append(f"Meta Report (5pm-5pm): {str(exc)[:120]}")
     if not frames:
-        return pd.DataFrame(columns=["campaign_name_spend", "campaign_key", "spend", "spend_accounts"]), errors
+        empty = pd.DataFrame(columns=["campaign_name_spend", "campaign_key", "spend", "spend_accounts"])
+        return empty, errors, authoritative_total
     raw = pd.concat(frames, ignore_index=True)
     raw["campaign_key"] = campaign_key(raw["Campaign Name"])
     grouped_spend = raw.groupby(["campaign_key", "Campaign Name"], as_index=False).agg(
@@ -108,7 +124,14 @@ def load_google_campaign_spend(window_end_date):
         spend_accounts=("Account", lambda values: ", ".join(sorted(set(values)))),
     )
     grouped_spend = grouped_spend.rename(columns={"Campaign Name": "campaign_name_spend"})
-    return grouped_spend, errors
+    # Account-summary rows are authoritative. Campaign rows can differ by one
+    # fils because the displayed campaign spends are individually rounded.
+    if authoritative_total is not None and not grouped_spend.empty:
+        difference = round(authoritative_total - float(grouped_spend["spend"].sum()), 2)
+        if abs(difference) <= 0.05 and difference:
+            largest = grouped_spend["spend"].idxmax()
+            grouped_spend.loc[largest, "spend"] += difference
+    return grouped_spend, errors, authoritative_total
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -351,7 +374,9 @@ if "analysis_inputs" in st.session_state:
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
     ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Google CRM orders": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
-    spend_data, spend_errors = load_google_campaign_spend(end_date)
+    spend_data, spend_errors, authoritative_spend = load_google_campaign_spend(
+        SPEND_START_DATE, SPEND_END_DATE
+    )
     st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors)
 elif "analysis_results" in st.session_state:
     joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors = st.session_state["analysis_results"]
@@ -414,7 +439,11 @@ with tabs[1]:
     if spend_errors:
         st.warning("Some Google Sheet campaign tabs could not be read: " + " | ".join(spend_errors))
     campaign_market = campaign_performance(joined, spend_data)
-    total_spend = float(campaign_market.spend.sum())
+    total_spend = (
+        float(authoritative_spend)
+        if authoritative_spend is not None
+        else float(campaign_market.spend.sum())
+    )
     marketing_joined = joined[joined["campaign_name"].fillna("").astype(str).str.strip().ne("")]
     total_leads = int(marketing_joined.shape[0])
     converted_leads = int(marketing_joined.converted.sum())
@@ -427,7 +456,11 @@ with tabs[1]:
     outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
     outcome_kpis[1].metric("Cost per order", f"AED {total_spend / converted_leads:,.2f}" if converted_leads else "N/A")
     outcome_kpis[2].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
-    st.caption(f"Spend: campaign-spend Google Sheet · Leads: generated DoubleTick report · Orders and revenue: live Google CRM phone matches.")
+    st.caption(
+        f"Spend: Meta Report Google Sheet, {SPEND_START_DATE.strftime('%d %b')}–"
+        f"{SPEND_END_DATE.strftime('%d %b %Y')} inclusive · Leads: generated DoubleTick report · "
+        "Orders and revenue: live Google CRM phone matches."
+    )
     st.markdown("#### Exact campaign performance")
     campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "cost_per_order", "roas"]
     st.dataframe(campaign_market[campaign_columns], hide_index=True, use_container_width=True, column_config={
