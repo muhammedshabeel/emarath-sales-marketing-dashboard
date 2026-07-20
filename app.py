@@ -3,13 +3,15 @@ import io
 from datetime import date, time, timedelta
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+from plotly.subplots import make_subplots
 from urllib.parse import quote
 
 from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_google_crm_orders, normalize_leads, qa_report
 from data_io import choose_best_sheet, detect_column, read_upload
-from enrichment import generate_fixed_zip_report
+from enrichment import classify_campaign, generate_fixed_zip_report
 
 st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="wide")
 
@@ -35,7 +37,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 17
+ANALYSIS_SCHEMA_VERSION = 19
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -107,16 +109,22 @@ def load_google_campaign_spend(window_start_date, window_end_date):
         f"?tqx=out:csv&sheet={quote('Meta Report (5pm-5pm)')}"
     )
     authoritative_total = None
+    daily_spend = pd.DataFrame(columns=["date", "spend"])
     try:
         summary = pd.read_csv(summary_url)
         summary_dates = pd.to_datetime(summary["Window End Date (Dubai)"], errors="coerce").dt.date
         summary_window = summary_dates.ge(window_start_date) & summary_dates.le(window_end_date)
-        authoritative_total = float(pd.to_numeric(summary.loc[summary_window, "Spend"], errors="coerce").fillna(0).sum())
+        summary_values = pd.to_numeric(summary.loc[summary_window, "Spend"], errors="coerce").fillna(0)
+        authoritative_total = float(summary_values.sum())
+        daily_spend = pd.DataFrame({
+            "date": summary_dates.loc[summary_window],
+            "spend": summary_values,
+        }).groupby("date", as_index=False)["spend"].sum()
     except Exception as exc:
         errors.append(f"Meta Report (5pm-5pm): {str(exc)[:120]}")
     if not frames:
         empty = pd.DataFrame(columns=["campaign_name_spend", "campaign_key", "spend", "spend_accounts"])
-        return empty, errors, authoritative_total
+        return empty, errors, authoritative_total, daily_spend
     raw = pd.concat(frames, ignore_index=True)
     raw["campaign_key"] = campaign_key(raw["Campaign Name"])
     grouped_spend = raw.groupby(["campaign_key", "Campaign Name"], as_index=False).agg(
@@ -131,7 +139,7 @@ def load_google_campaign_spend(window_start_date, window_end_date):
         if abs(difference) <= 0.05 and difference:
             largest = grouped_spend["spend"].idxmax()
             grouped_spend.loc[largest, "spend"] += difference
-    return grouped_spend, errors, authoritative_total
+    return grouped_spend, errors, authoritative_total, daily_spend
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -173,13 +181,58 @@ def campaign_performance(joined, spend_data):
     performance["spend"] = pd.to_numeric(performance.get("spend", 0), errors="coerce").fillna(0.0)
     performance["cpl"] = performance["spend"].div(performance["leads"].replace(0, pd.NA))
     performance["conversion_rate"] = performance["orders"].div(performance["leads"].replace(0, pd.NA)).mul(100)
-    performance["cost_per_order"] = performance["spend"].div(performance["orders"].replace(0, pd.NA))
     performance["roas"] = performance["revenue"].div(performance["spend"].replace(0, pd.NA))
     performance["campaign_name"] = performance["campaign_name"].fillna("Unmatched spend campaign").astype(str)
     performance["conversion_rate"] = pd.to_numeric(performance["conversion_rate"], errors="coerce").fillna(0.0).astype(float)
     performance["orders"] = pd.to_numeric(performance["orders"], errors="coerce").fillna(0).astype(int)
     performance["spend"] = pd.to_numeric(performance["spend"], errors="coerce").fillna(0.0).astype(float)
     return performance.sort_values("spend", ascending=False)
+
+
+def country_performance(joined, spend_data):
+    """Return complete UAE/KSA/Qatar/Bahrain spend and CPL performance."""
+    countries = pd.DataFrame({"country": ["UAE", "KSA", "QATAR", "BAHRAIN"]})
+    lead_summary = grouped(joined, "country")
+    if lead_summary.empty:
+        lead_summary = pd.DataFrame(columns=["country", "leads", "orders", "revenue", "conversion_rate"])
+    lead_summary["country"] = lead_summary["country"].astype("string").str.upper()
+
+    spend_rows = spend_data.copy()
+    spend_rows["country"] = spend_rows["campaign_name_spend"].map(
+        lambda value: str(classify_campaign(value)[0]).upper()
+    )
+    country_spend = spend_rows.groupby("country", as_index=False)["spend"].sum()
+    result = countries.merge(
+        lead_summary[["country", "leads", "orders", "revenue", "conversion_rate"]],
+        on="country", how="left",
+    ).merge(country_spend, on="country", how="left")
+    for column in ["leads", "orders", "revenue", "conversion_rate", "spend"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+    result["leads"] = result["leads"].astype(int)
+    result["orders"] = result["orders"].astype(int)
+    result["cpl"] = result["spend"].div(result["leads"].replace(0, pd.NA))
+    return result
+
+
+def daily_marketing_performance(joined, daily_spend):
+    dates = pd.DataFrame({
+        "date": pd.date_range(SPEND_START_DATE, SPEND_END_DATE, freq="D").date
+    })
+    attributed = joined[joined["campaign_name"].fillna("").astype(str).str.strip().ne("")].copy()
+    attributed["date"] = pd.to_datetime(attributed["lead_time"], errors="coerce").dt.date
+    daily_leads = attributed.groupby("date", as_index=False).agg(
+        leads=("lead_row", "size"),
+        orders=("converted", "sum"),
+        revenue=("order_value", "sum"),
+    )
+    result = dates.merge(daily_spend, on="date", how="left").merge(daily_leads, on="date", how="left")
+    for column in ["spend", "leads", "orders", "revenue"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+    result["leads"] = result["leads"].astype(int)
+    result["orders"] = result["orders"].astype(int)
+    result["cpl"] = result["spend"].div(result["leads"].replace(0, pd.NA))
+    result["conversion_rate"] = result["orders"].div(result["leads"].replace(0, pd.NA)).mul(100)
+    return result
 
 
 def mapping_ui(df, source):
@@ -374,7 +427,7 @@ if "analysis_inputs" in st.session_state:
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
     ranges = {"DoubleTick attribution API dates": (start_date, end_date), "Google CRM orders": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
-    spend_data, spend_errors, authoritative_spend = load_google_campaign_spend(
+    spend_data, spend_errors, authoritative_spend, daily_spend = load_google_campaign_spend(
         SPEND_START_DATE, SPEND_END_DATE
     )
     st.session_state["analysis_results"] = (joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report, spend_data, spend_errors)
@@ -452,23 +505,77 @@ with tabs[1]:
     primary_kpis[0].metric("Meta spend", f"AED {total_spend:,.2f}")
     primary_kpis[1].metric("Attributed leads", f"{total_leads:,}")
     primary_kpis[2].metric("Cost per lead", f"AED {total_spend / total_leads:,.2f}" if total_leads else "N/A")
-    outcome_kpis = st.columns(3)
+    outcome_kpis = st.columns(2)
     outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
-    outcome_kpis[1].metric("Cost per order", f"AED {total_spend / converted_leads:,.2f}" if converted_leads else "N/A")
-    outcome_kpis[2].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
+    outcome_kpis[1].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
     st.caption(
         f"Spend: Meta Report Google Sheet, {SPEND_START_DATE.strftime('%d %b')}–"
         f"{SPEND_END_DATE.strftime('%d %b %Y')} inclusive · Leads: generated DoubleTick report · "
         "Orders and revenue: live Google CRM phone matches."
     )
+    st.markdown("#### Country-wise marketing performance")
+    country_market = country_performance(joined, spend_data)
+    country_cards = st.columns(4)
+    for position, row in enumerate(country_market.itertuples(index=False)):
+        with country_cards[position]:
+            st.metric(
+                row.country,
+                f"AED {row.cpl:,.2f} CPL" if pd.notna(row.cpl) else "CPL unavailable",
+                f"AED {row.spend:,.2f} spend · {row.leads:,} leads",
+                delta_color="off",
+            )
+    st.dataframe(
+        country_market,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "country": "Country",
+            "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
+            "leads": st.column_config.NumberColumn("Attributed leads", format="%d"),
+            "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
+            "orders": st.column_config.NumberColumn("Converted orders", format="%d"),
+            "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
+            "conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"),
+        },
+    )
+
+    st.markdown("#### Daily spend and CPL")
+    daily_market = daily_marketing_performance(joined, daily_spend)
+    daily_chart = make_subplots(specs=[[{"secondary_y": True}]])
+    daily_chart.add_trace(
+        go.Bar(x=daily_market["date"], y=daily_market["spend"], name="Spend (AED)", marker_color="#176b87"),
+        secondary_y=False,
+    )
+    daily_chart.add_trace(
+        go.Scatter(x=daily_market["date"], y=daily_market["cpl"], name="CPL (AED)", mode="lines+markers", line=dict(color="#d4a017", width=3)),
+        secondary_y=True,
+    )
+    daily_chart.update_yaxes(title_text="Spend (AED)", secondary_y=False)
+    daily_chart.update_yaxes(title_text="CPL (AED)", secondary_y=True)
+    daily_chart.update_layout(height=410, margin=dict(l=15, r=15, t=35, b=15), legend_orientation="h")
+    st.plotly_chart(daily_chart, use_container_width=True)
+    st.dataframe(
+        daily_market,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+            "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
+            "leads": st.column_config.NumberColumn("Attributed leads", format="%d"),
+            "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
+            "orders": st.column_config.NumberColumn("Converted orders", format="%d"),
+            "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
+            "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
+        },
+    )
+
     st.markdown("#### Exact campaign performance")
-    campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "cost_per_order", "roas"]
+    campaign_columns = ["campaign_name", "spend_accounts", "spend", "leads", "orders", "revenue", "cpl", "conversion_rate", "roas"]
     st.dataframe(campaign_market[campaign_columns], hide_index=True, use_container_width=True, column_config={
         "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
         "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
         "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
         "conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"),
-        "cost_per_order": st.column_config.NumberColumn("Cost/order (AED)", format="%.2f"),
         "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
     })
     chart_data = campaign_market[campaign_market.spend.gt(0)].head(20).copy()
@@ -487,11 +594,9 @@ with tabs[1]:
     market = market.merge(dimension_spend, on=view, how="left")
     market["spend"] = market["spend"].fillna(0.0)
     market["cpl"] = market.spend.div(market.leads.replace(0, pd.NA))
-    market["cost_per_order"] = market.spend.div(market.orders.replace(0, pd.NA))
     st.dataframe(market, hide_index=True, use_container_width=True, column_config={
         "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
         "cpl": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
-        "cost_per_order": st.column_config.NumberColumn("Cost/order (AED)", format="%.2f"),
         "conversion_rate": st.column_config.NumberColumn("Conversion %", format="%.1f%%"),
     })
     st.markdown("#### Attribution/classification exceptions")
