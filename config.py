@@ -6,7 +6,7 @@ COUNTRY_ALIASES = {
 }
 
 PRODUCT_ALIASES = {
-    "Al Huda": ["ALHUDA", "AL HUDA"],
+    "Al Huda": ["ALHUDA", "AL HUDA", "HUDA"],
     "Premium Edition": ["PREMIUM", "PREMIUM EDITION"],
     "Clive": ["CLIVE"],
     "DOE": ["DOE"],
