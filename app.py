@@ -34,7 +34,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × Workpex conversion × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 11
+ANALYSIS_SCHEMA_VERSION = 12
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
@@ -43,6 +43,15 @@ if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
 def secret(name, default=""):
     try: return str(st.secrets.get(name, default))
     except Exception: return default
+
+
+@st.cache_data(ttl=21600, max_entries=3, show_spinner=False)
+def cached_attribution_report(phone_tuple, api_key, meta_token, waba_tuple, start_date, end_date):
+    """Cache the expensive DoubleTick → Meta report for identical inputs."""
+    return generate_fixed_zip_report(
+        phone_tuple, api_key, meta_token, list(waba_tuple), start_date, end_date,
+        doubletick_workers=24, meta_workers=16,
+    )
 
 
 SPEND_SHEET_ID = "1RSGCdB6UUFeFrX1mksMCBtElc9AijrKrlqR7tsP5fNg"
@@ -283,12 +292,12 @@ if submitted:
         wabas = ["".join(filter(str.isdigit, x)) for x in secret("DOUBLETICK_WABA_NUMBERS", "971521367907").split(",") if x.strip()]
     if not api_key or not meta_token:
         st.error("DOUBLETICK_API_KEY and META_ACCESS_TOKEN are both required in Streamlit App settings → Secrets."); st.stop()
-    bar = st.progress(0, text="Fetching DoubleTick chats…")
-    dt_report = generate_fixed_zip_report(
-        leads.lead_phone, api_key, meta_token, wabas, start_date, end_date,
-        doubletick_progress=lambda x: bar.progress(x, text="Generating report from the replaced DoubleTick phone list…"),
-        meta_progress=lambda x: bar.progress(x, text="Resolving generated Ad IDs through Meta…"),
+    phone_tuple = tuple(leads.lead_phone.fillna("").astype(str))
+    bar = st.progress(10, text=f"Generating attribution for {len(set(phone_tuple)):,} unique phones — cached results are reused…")
+    dt_report = cached_attribution_report(
+        phone_tuple, api_key, meta_token, tuple(wabas), start_date, end_date,
     )
+    bar.progress(100, text="DoubleTick and Meta attribution ready.")
     attribution = normalize_attribution(dt_report, {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status", "classification": "classification_text"})
     leads = attach_attribution(leads, attribution)
     bar.empty()
