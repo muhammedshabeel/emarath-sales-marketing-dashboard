@@ -89,7 +89,15 @@ def choose_best_sheet(frames, role):
 
 
 def phone_digits(series):
-    return series.fillna("").astype(str).str.replace(r"\D", "", regex=True).str.removeprefix("00")
+    # CSV columns containing phone numbers and blanks are often inferred as
+    # floats. Converting those values directly to strings adds `.0`, which
+    # would incorrectly turn 918089262612 into 9180892626120. Normalize
+    # integer-like numeric values first, including scientific notation.
+    values = series.fillna("").astype("string").str.strip()
+    numeric = pd.to_numeric(values, errors="coerce")
+    integer_like = numeric.notna() & numeric.mod(1).eq(0)
+    values.loc[integer_like] = numeric.loc[integer_like].map(lambda value: f"{value:.0f}")
+    return values.str.replace(r"\D", "", regex=True).str.removeprefix("00")
 
 
 def last8(series):
