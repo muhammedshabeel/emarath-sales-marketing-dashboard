@@ -25,6 +25,7 @@ PRODUCT_ALIASES = {
     "Shadow Flame": ["SHADOW FLAME"],
     "Luminux": ["LUMINUX"],
     "Archer": ["ARCHER"],
+    "Collection Of Moods": ["COLLECTION OF MOODS", "COLLECTIONOFMOODS"],
 }
 
 PRODUCT_VENDOR = {
@@ -33,10 +34,13 @@ PRODUCT_VENDOR = {
     "Clive": "Scent Passion",
     "DOE": "Scent Passion",
     "Ameerat Al Arab": "Scent Passion",
-    "Oud Lovers": "Oud Lovers",
+    "Oud Lovers": "LPG",
     "Absolute Mountain": "Atyaf",
     "Volga": "Atyaf",
     "Hector": "Atyaf",
+    "Archer": "Atyaf",
+    "Collection Of Moods": "Atyaf",
+    "Luminux": "Oud Al Salam",
     "Esencia": "Scent Passion",
     "Falcon": "LPG",
     "Arbe Puro": "LPG",
