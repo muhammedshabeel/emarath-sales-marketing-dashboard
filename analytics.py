@@ -1,8 +1,44 @@
 from __future__ import annotations
+import re
 import pandas as pd
 from config import AGENT_PHONE_NAME, ANSWERED_WORDS, WON_WORDS
 from data_io import last8, parse_duration_seconds, phone_digits
 from enrichment import classify_campaign
+
+
+WORKPEX_AGENT_ALIASES = {
+    "RESHMI EMARATH": "Reshmi Emarath",
+    "ANSAR UAE": "Ansar Emarath",
+    "ANSHAD UAE": "ANSHAD EMARATH",
+    "NIHAD V P": "NIHAD",
+    "JAHID N": "JAHID",
+    "NEHA P": "NEHA P",
+    "RAHIYAD K": "RAHIYAD",
+    "SHIHAD K": "SHIHAD",
+    "FATHIMA LIYA": "FATHIMA LIYA",
+    "ADWAITHA T M": "ADWAITHA T M",
+    "NAFIH P": "NAFIH",
+    "RANJITH LAL": "RANJITH",
+    "SHIBIL P": "SHIBIL",
+    "SHAMNA NAJIYA": "SHAMNA NAJIYA",
+    "HASNA H": "Hasna",
+    "ADNAN S": "ADNAN",
+}
+
+
+def normalize_workpex_agent(value):
+    if pd.isna(value) or not str(value).strip():
+        return "Unassigned"
+    # Workpex can export the same owner more than once in one cell, e.g.
+    # "Ansar UAE, Ansar UAE, Ansar UAE". Collapse repeated labels without
+    # changing the number of converted-lead rows.
+    labels = [label.strip() for label in str(value).split(",") if label.strip()]
+    distinct = list(dict.fromkeys(re.sub(r"\s+", " ", label).upper() for label in labels))
+    if not distinct:
+        return "Unassigned"
+    if len(distinct) > 1:
+        return " / ".join(WORKPEX_AGENT_ALIASES.get(label, label.title()) for label in distinct)
+    return WORKPEX_AGENT_ALIASES.get(distinct[0], labels[0])
 
 
 def parse_time(series, source_tz, report_tz):
@@ -59,7 +95,7 @@ def normalize_sales(df, mapping, source_tz, report_tz):
     out = pd.DataFrame(index=df.index)
     out["phone_key"] = last8(df[mapping["phone"]])
     out["sale_time"] = parse_time(df[mapping["datetime"]], source_tz, report_tz) if mapping.get("datetime") else pd.NaT
-    out["sales_agent"] = df[mapping["agent"]].fillna("").astype(str).str.strip() if mapping.get("agent") else ""
+    out["sales_agent"] = df[mapping["agent"]].map(normalize_workpex_agent) if mapping.get("agent") else "Unassigned"
     out["order_id"] = df[mapping["order_id"]].fillna("").astype(str).str.strip() if mapping.get("order_id") else ""
     out["order_status"] = df[mapping["status"]].fillna("").astype(str).str.strip() if mapping.get("status") else ""
     out["order_product"] = df[mapping["product"]].fillna("").astype(str).str.strip() if mapping.get("product") else ""
