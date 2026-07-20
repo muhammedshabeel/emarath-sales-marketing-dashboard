@@ -35,7 +35,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 20
+ANALYSIS_SCHEMA_VERSION = 22
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -463,14 +463,18 @@ else:
 if joined.empty:
     st.error("The DoubleTick upload contains no usable lead rows."); st.stop()
 
+# A lead is one unique customer phone from the uploaded DoubleTick report.
+# Repeated rows for the same normalized phone must never inflate marketing KPIs.
+doubletick_unique = joined.drop_duplicates("phone_key", keep="first").copy()
+
 if len({dt_tz, cx_tz}) > 1:
     st.warning("Source timezones differ. Times were converted to the selected report timezone; verify those source timezone selections.")
 
-st.markdown(f"""<div class="hero"><h2>Performance command centre</h2><p>{len(joined):,} assigned leads · {pd.Timestamp(call_start).strftime('%d %b, %I:%M %p')} to {pd.Timestamp(call_end).strftime('%d %b, %I:%M %p')} · Dubai time</p></div>""", unsafe_allow_html=True)
+st.markdown(f"""<div class="hero"><h2>Performance command centre</h2><p>{len(doubletick_unique):,} unique DoubleTick leads · {pd.Timestamp(call_start).strftime('%d %b, %I:%M %p')} to {pd.Timestamp(call_end).strftime('%d %b, %I:%M %p')} · Dubai time</p></div>""", unsafe_allow_html=True)
 tabs = st.tabs(["Overview", "Marketing", "Sales", "3CX calls", "Agent scorecards", "Data quality"])
 
 with tabs[0]:
-    total_leads, total_orders = len(joined), len(orders)
+    total_leads, total_orders = len(doubletick_unique), len(orders)
     lead_orders = int(orders.order_from_generated_lead.sum())
     other_source_orders = total_orders - lead_orders
     gcc_leads = joined[joined.lead_region.eq("GCC")]
@@ -525,8 +529,8 @@ with tabs[1]:
         st.error("The marketing start date must be on or before the end date.")
         st.stop()
 
-    lead_dates = pd.to_datetime(joined["lead_time"], errors="coerce").dt.date
-    marketing_joined_all = joined[
+    lead_dates = pd.to_datetime(doubletick_unique["lead_time"], errors="coerce").dt.date
+    date_filtered_joined = doubletick_unique[
         lead_dates.ge(marketing_start) & lead_dates.le(marketing_end)
     ].copy()
     campaign_spend_view = daily_campaign_spend[
@@ -539,31 +543,34 @@ with tabs[1]:
     selected_authoritative_spend = float(daily_spend_view["spend"].sum())
     spend_data_view = aggregate_campaign_spend(campaign_spend_view, selected_authoritative_spend)
 
-    missing_attr = marketing_joined_all[~marketing_joined_all.attribution_found].copy() if "attribution_found" in marketing_joined_all else marketing_joined_all.iloc[0:0]
+    missing_attr = doubletick_unique[~doubletick_unique.attribution_found].copy() if "attribution_found" in doubletick_unique else doubletick_unique.iloc[0:0]
     if len(missing_attr):
         st.error(f"{len(missing_attr):,} DoubleTick assignments are missing from the Ad/Meta attribution report.")
     if spend_errors:
         st.warning("Some Google Sheet campaign tabs could not be read: " + " | ".join(spend_errors))
-    campaign_market = campaign_performance(marketing_joined_all, spend_data_view)
+    campaign_market = campaign_performance(doubletick_unique, spend_data_view)
     total_spend = selected_authoritative_spend
-    marketing_joined = marketing_joined_all[marketing_joined_all["campaign_name"].fillna("").astype(str).str.strip().ne("")]
+    # The uploaded/generated DoubleTick report is authoritative for lead count.
+    # Never remove its rows with the marketing spend date selector.
+    marketing_joined = doubletick_unique
     total_leads = int(marketing_joined.shape[0])
     converted_leads = int(marketing_joined.converted.sum())
     total_revenue = float(marketing_joined.order_value.sum())
     primary_kpis = st.columns(3)
     primary_kpis[0].metric("Meta spend", f"AED {total_spend:,.2f}")
-    primary_kpis[1].metric("Attributed leads", f"{total_leads:,}")
+    primary_kpis[1].metric("DoubleTick leads", f"{total_leads:,}")
     primary_kpis[2].metric("Cost per lead", f"AED {total_spend / total_leads:,.2f}" if total_leads else "N/A")
     outcome_kpis = st.columns(2)
     outcome_kpis[0].metric("Converted leads", f"{converted_leads:,}", f"{converted_leads / total_leads * 100:.1f}% conversion" if total_leads else None)
     outcome_kpis[1].metric("Lead-order revenue / ROAS", f"AED {total_revenue:,.2f}", f"{total_revenue / total_spend:.2f}× ROAS" if total_spend else "ROAS unavailable")
     st.caption(
         f"Spend: Meta Report Google Sheet, {marketing_start.strftime('%d %b')}–"
-        f"{marketing_end.strftime('%d %b %Y')} inclusive · Leads: generated DoubleTick report · "
+        f"{marketing_end.strftime('%d %b %Y')} inclusive · Leads: complete generated DoubleTick report "
+        "(not reduced by the spend-date filter) · "
         "Orders and revenue: live Google CRM phone matches."
     )
     st.markdown("#### Country-wise marketing performance")
-    country_market = country_performance(marketing_joined_all, spend_data_view)
+    country_market = country_performance(doubletick_unique, spend_data_view)
     country_cards = st.columns(4)
     for position, row in enumerate(country_market.itertuples(index=False)):
         with country_cards[position]:
@@ -597,7 +604,7 @@ with tabs[1]:
     for daily_tab, dimension, allowed_values in daily_specs:
         with daily_tab:
             daily_breakdown = daily_dimension_performance(
-                marketing_joined_all, campaign_spend_view, dimension
+                date_filtered_joined, campaign_spend_view, dimension
             )
             normalized = daily_breakdown[dimension].astype("string").str.upper()
             allowed_upper = [value.upper() for value in allowed_values]
@@ -646,8 +653,8 @@ with tabs[1]:
     fig.update_layout(xaxis_title="", yaxis_title="Spend (AED)", height=430)
     st.plotly_chart(fig, use_container_width=True)
     view = st.radio("Operational breakdown", ["country", "vendor"], horizontal=True)
-    market = grouped(marketing_joined_all, view)
-    campaign_dimensions = marketing_joined_all[["campaign_name", view]].drop_duplicates()
+    market = grouped(doubletick_unique, view)
+    campaign_dimensions = doubletick_unique[["campaign_name", view]].drop_duplicates()
     campaign_dimensions["campaign_key"] = campaign_key(campaign_dimensions["campaign_name"])
     dimension_spend = spend_data_view.merge(campaign_dimensions[["campaign_key", view]], on="campaign_key", how="left").groupby(view, dropna=False).spend.sum().reset_index()
     market = market.merge(dimension_spend, on=view, how="left")
