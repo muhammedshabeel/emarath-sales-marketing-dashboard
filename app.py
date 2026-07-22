@@ -359,10 +359,14 @@ def render_historical_dashboard(raw, historical):
     cpl = total_meta_spend / len(filtered) if len(filtered) else 0.0
     cost_per_win = total_meta_spend / len(won) if len(won) else 0.0
     roas = revenue / total_meta_spend if total_meta_spend else 0.0
+    estimated_profit = float(won["estimated_profit"].sum())
+    profit_margin_rate = estimated_profit / revenue * 100 if revenue else 0.0
+    profit_after_meta = estimated_profit - total_meta_spend
     previous_period = period - 1
     previous = historical[historical["month"].eq(str(previous_period))]
     previous_won = previous[previous["is_won"]]
     previous_revenue = float(previous_won["order_value"].sum())
+    previous_profit = float(previous_won["estimated_profit"].sum())
 
     def change(current, prior):
         if not prior:
@@ -374,7 +378,7 @@ def render_historical_dashboard(raw, historical):
         f'repeated customer orders preserved</p></div>',
         unsafe_allow_html=True,
     )
-    tabs = st.tabs(["Executive", "Monthly trends", "Meta spend", "Agents", "Markets & products", "Data quality"])
+    tabs = st.tabs(["Executive", "Monthly trends", "Meta spend", "Profit analysis", "Agents", "Markets & products", "Data quality"])
 
     with tabs[0]:
         st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
@@ -388,6 +392,12 @@ def render_historical_dashboard(raw, historical):
         row2[1].metric("Repeat orders", f"{len(repeat_orders):,}", f"{len(repeat_orders) / len(won) * 100:.1f}% of wins" if len(won) else None)
         row2[2].metric("Repeat-order revenue", f"AED {repeat_orders['order_value'].sum():,.2f}")
         row2[3].metric("Active agents", f"{filtered.loc[filtered.agent.ne('UNASSIGNED'), 'agent'].nunique():,}")
+        st.markdown('<div class="section-label">Estimated order profit</div>', unsafe_allow_html=True)
+        profit_kpis = st.columns(4)
+        profit_kpis[0].metric("Vendor-based profit", f"AED {estimated_profit:,.2f}", change(estimated_profit, previous_profit))
+        profit_kpis[1].metric("Profit margin", f"{profit_margin_rate:.1f}%", "Profit ÷ won revenue")
+        profit_kpis[2].metric("Profit after Meta spend", f"AED {profit_after_meta:,.2f}")
+        profit_kpis[3].metric("Profit per won order", f"AED {estimated_profit / len(won):,.2f}" if len(won) else "N/A")
         st.markdown('<div class="section-label">Meta advertising</div>', unsafe_allow_html=True)
         spend_kpis = st.columns(4)
         spend_kpis[0].metric("Meta spend", f"AED {total_meta_spend:,.2f}")
@@ -425,6 +435,8 @@ def render_historical_dashboard(raw, historical):
         monthly["cost_per_lead"] = monthly["spend"].div(monthly["leads"].replace(0, pd.NA))
         monthly["cost_per_won_order"] = monthly["spend"].div(monthly["won_orders"].replace(0, pd.NA))
         monthly["roas"] = monthly["revenue"].div(monthly["spend"].replace(0, pd.NA))
+        monthly["profit_margin"] = monthly["estimated_profit"].div(monthly["revenue"].replace(0, pd.NA)).mul(100)
+        monthly["profit_after_meta"] = monthly["estimated_profit"] - monthly["spend"]
         st.markdown("#### Monthly operating scorecard")
         st.dataframe(
             monthly, hide_index=True, use_container_width=True,
@@ -436,6 +448,9 @@ def render_historical_dashboard(raw, historical):
                 "first_time_orders": "First-time orders", "repeat_orders": "Repeat orders",
                 "repeat_revenue": st.column_config.NumberColumn("Repeat revenue (AED)", format="%.2f"),
                 "active_agents": "Active agents",
+                "estimated_profit": st.column_config.NumberColumn("Vendor profit (AED)", format="%.2f"),
+                "profit_margin": st.column_config.NumberColumn("Profit margin", format="%.1f%%"),
+                "profit_after_meta": st.column_config.NumberColumn("Profit after Meta (AED)", format="%.2f"),
                 "spend": st.column_config.NumberColumn("Meta spend (AED)", format="%.2f"),
                 "cost_per_lead": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
                 "cost_per_won_order": st.column_config.NumberColumn("Cost / won order", format="%.2f"),
@@ -465,6 +480,28 @@ def render_historical_dashboard(raw, historical):
             st.download_button("Download Meta spend detail (.csv)", meta_spend.to_csv(index=False).encode("utf-8"), file_name=f"meta_spend_{start}_{end}.csv", mime="text/csv")
 
     with tabs[3]:
+        st.markdown("#### Vendor-based profit analysis")
+        st.caption("Profit is calculated only for WON rows using the confirmed fixed AED profit per order. Valid repeat orders are included.")
+        vendors = dimension_summary(filtered, "vendor")
+        fig = px.bar(
+            vendors.sort_values("estimated_profit"), x="estimated_profit", y="vendor",
+            orientation="h", text="won_orders", color="conversion_rate",
+            title="Estimated profit by vendor · labels show WON orders",
+            color_continuous_scale=["#dceff3", "#16856b"],
+        )
+        fig.update_layout(xaxis_title="Estimated profit (AED)", yaxis_title="", height=420)
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(
+            vendors, hide_index=True, use_container_width=True,
+            column_config={
+                "vendor": "Vendor", "leads": "Rows", "won_orders": "WON orders",
+                "revenue": st.column_config.NumberColumn("WON revenue (AED)", format="%.2f"),
+                "estimated_profit": st.column_config.NumberColumn("Estimated profit (AED)", format="%.2f"),
+                "conversion_rate": st.column_config.ProgressColumn("Conversion", min_value=0, max_value=100, format="%.1f%%"),
+            },
+        )
+
+    with tabs[4]:
         agents = dimension_summary(filtered, "agent")
         agents = agents[agents["agent"].ne("UNASSIGNED")]
         st.markdown("#### Agent performance")
@@ -483,7 +520,7 @@ def render_historical_dashboard(raw, historical):
             },
         )
 
-    with tabs[4]:
+    with tabs[5]:
         breakdown_tabs = st.tabs(["Country", "Product", "Customer path", "Ad source"])
         for tab, dimension, label in zip(
             breakdown_tabs,
@@ -501,7 +538,7 @@ def render_historical_dashboard(raw, historical):
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(summary, hide_index=True, use_container_width=True)
 
-    with tabs[5]:
+    with tabs[6]:
         quality = quality_summary(raw, historical)
         st.markdown("#### Reconciliation and source integrity")
         st.dataframe(quality, hide_index=True, use_container_width=True)
@@ -522,6 +559,7 @@ def render_historical_dashboard(raw, historical):
         "Agent_Summary": dimension_summary(filtered, "agent"),
         "Country_Summary": dimension_summary(filtered, "country"),
         "Product_Summary": dimension_summary(filtered, "product"),
+        "Vendor_Profit": dimension_summary(filtered, "vendor"),
         "Data_Quality": quality_summary(raw, historical),
     })
     st.download_button(
