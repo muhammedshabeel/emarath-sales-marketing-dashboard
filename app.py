@@ -925,10 +925,20 @@ with tabs[1]:
         st.error("The marketing start date must be on or before the end date.")
         st.stop()
 
-    lead_dates = pd.to_datetime(doubletick_report["lead_time"], errors="coerce").dt.date
-    date_filtered_joined = doubletick_report[
-        lead_dates.ge(marketing_start) & lead_dates.le(marketing_end)
-    ].copy()
+    # Compare one consistent datetime type. ``lead_time`` is timezone-aware,
+    # while Streamlit's date picker returns ``datetime.date`` objects; mixing
+    # those types raises in recent pandas versions and prevents every tab from
+    # rendering because Streamlit evaluates all tab bodies on each rerun.
+    lead_dates = pd.to_datetime(doubletick_report["lead_time"], errors="coerce")
+    if getattr(lead_dates.dt, "tz", None) is not None:
+        lead_dates = lead_dates.dt.tz_localize(None)
+    lead_dates = lead_dates.dt.normalize()
+    marketing_start_ts = pd.Timestamp(marketing_start).normalize()
+    marketing_end_ts = pd.Timestamp(marketing_end).normalize()
+    marketing_date_mask = lead_dates.between(
+        marketing_start_ts, marketing_end_ts, inclusive="both"
+    ).fillna(False)
+    date_filtered_joined = doubletick_report.loc[marketing_date_mask].copy()
     campaign_spend_view = daily_campaign_spend[
         daily_campaign_spend["spend_date"].ge(marketing_start)
         & daily_campaign_spend["spend_date"].le(marketing_end)
