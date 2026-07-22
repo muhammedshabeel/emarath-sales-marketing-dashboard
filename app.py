@@ -10,6 +10,14 @@ from urllib.parse import quote
 from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_google_crm_orders, normalize_leads, qa_report
 from data_io import choose_best_sheet, detect_column, read_upload
 from enrichment import classify_campaign, generate_fixed_zip_report
+from historical import (
+    HISTORICAL_SHEET_ID,
+    dimension_summary,
+    monthly_summary,
+    normalize_historical_rows,
+    quality_summary,
+    read_historical_workbook,
+)
 
 st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="wide")
 
@@ -35,7 +43,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick attribution × live Google CRM orders × 3CX call execution")
 
-ANALYSIS_SCHEMA_VERSION = 25
+ANALYSIS_SCHEMA_VERSION = 26
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -307,6 +315,201 @@ def excel_bytes(tables):
             export.to_excel(writer, sheet_name=safe, index=False)
             ws = writer.sheets[safe]; ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
     return buffer.getvalue()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_historical_source(sheet_url):
+    raw = read_historical_workbook(sheet_url)
+    return raw, normalize_historical_rows(raw)
+
+
+def render_historical_dashboard(raw, historical):
+    minimum = historical["lead_date"].min().date()
+    maximum = historical["lead_date"].max().date()
+    selected_range = st.sidebar.date_input(
+        "Historical date range", value=(minimum, maximum), min_value=minimum,
+        max_value=maximum, format="DD/MM/YYYY", key="historical_date_range",
+    )
+    if not isinstance(selected_range, (tuple, list)) or len(selected_range) != 2:
+        st.info("Select both a start date and an end date.")
+        st.stop()
+    start, end = selected_range
+    filtered = historical[
+        historical["lead_date"].dt.date.ge(start) & historical["lead_date"].dt.date.le(end)
+    ].copy()
+    if filtered.empty:
+        st.warning("No historical rows exist in the selected period.")
+        st.stop()
+
+    won = filtered[filtered["is_won"]]
+    first_orders = won[won["order_type"].eq("First-time order")]
+    repeat_orders = won[won["order_type"].eq("Repeat order")]
+    conversion = len(won) / len(filtered) * 100
+    revenue = float(won["order_value"].sum())
+    average_order = revenue / len(won) if len(won) else 0
+    st.markdown(
+        f'<div class="hero"><h2>Historical business command centre</h2>'
+        f'<p>{len(filtered):,} source rows · {start.strftime("%d %b %Y")} to '
+        f'{end.strftime("%d %b %Y")} · repeated customer orders preserved</p></div>',
+        unsafe_allow_html=True,
+    )
+    tabs = st.tabs(["Executive", "Monthly trends", "Agents", "Markets & products", "Data quality"])
+
+    with tabs[0]:
+        st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
+        row1 = st.columns(4)
+        row1[0].metric("Lead rows", f"{len(filtered):,}")
+        row1[1].metric("Won orders", f"{len(won):,}", f"{conversion:.1f}% conversion")
+        row1[2].metric("Won revenue", f"AED {revenue:,.2f}")
+        row1[3].metric("Average order value", f"AED {average_order:,.2f}")
+        row2 = st.columns(4)
+        row2[0].metric("First-time orders", f"{len(first_orders):,}")
+        row2[1].metric("Repeat orders", f"{len(repeat_orders):,}", f"{len(repeat_orders) / len(won) * 100:.1f}% of wins" if len(won) else None)
+        row2[2].metric("Repeat-order revenue", f"AED {repeat_orders['order_value'].sum():,.2f}")
+        row2[3].metric("Active agents", f"{filtered.loc[filtered.agent.ne('UNASSIGNED'), 'agent'].nunique():,}")
+        overview = monthly_summary(filtered)
+        left, right = st.columns([1.55, 1])
+        with left:
+            trend = overview.melt(
+                id_vars="month", value_vars=["leads", "won_orders"],
+                var_name="metric", value_name="count",
+            )
+            fig = px.line(trend, x="month", y="count", color="metric", markers=True,
+                          title="Monthly lead and order movement",
+                          color_discrete_map={"leads": "#176b87", "won_orders": "#d4a017"})
+            fig.update_layout(height=390, xaxis_title="", yaxis_title="Rows", legend_title="")
+            st.plotly_chart(fig, use_container_width=True)
+        with right:
+            mix = pd.DataFrame({
+                "type": ["First-time orders", "Repeat orders"],
+                "orders": [len(first_orders), len(repeat_orders)],
+            })
+            fig = px.pie(mix, names="type", values="orders", hole=.65, title="Order mix",
+                         color="type", color_discrete_map={"First-time orders": "#16856b", "Repeat orders": "#d4a017"})
+            fig.update_layout(height=390, legend_orientation="h")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tabs[1]:
+        monthly = monthly_summary(filtered)
+        st.markdown("#### Monthly operating scorecard")
+        st.dataframe(
+            monthly, hide_index=True, use_container_width=True,
+            column_config={
+                "month": "Month", "leads": st.column_config.NumberColumn("Lead rows", format="%d"),
+                "won_orders": st.column_config.NumberColumn("Won orders", format="%d"),
+                "conversion_rate": st.column_config.ProgressColumn("Conversion", min_value=0, max_value=100, format="%.1f%%"),
+                "revenue": st.column_config.NumberColumn("Won revenue (AED)", format="%.2f"),
+                "first_time_orders": "First-time orders", "repeat_orders": "Repeat orders",
+                "repeat_revenue": st.column_config.NumberColumn("Repeat revenue (AED)", format="%.2f"),
+                "active_agents": "Active agents",
+            },
+        )
+        revenue_chart = monthly.melt(id_vars="month", value_vars=["revenue", "repeat_revenue"],
+                                     var_name="metric", value_name="amount")
+        fig = px.bar(revenue_chart, x="month", y="amount", color="metric", barmode="group",
+                     title="Monthly won revenue and repeat-order contribution",
+                     color_discrete_map={"revenue": "#176b87", "repeat_revenue": "#d4a017"})
+        fig.update_layout(xaxis_title="", yaxis_title="AED", legend_title="")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tabs[2]:
+        agents = dimension_summary(filtered, "agent")
+        agents = agents[agents["agent"].ne("UNASSIGNED")]
+        st.markdown("#### Agent performance")
+        fig = px.scatter(agents.head(40), x="leads", y="won_orders", size="revenue",
+                         color="conversion_rate", hover_name="agent", title="Agent volume, wins and conversion",
+                         color_continuous_scale=["#dceff3", "#16856b"])
+        fig.update_layout(height=480, xaxis_title="Lead rows", yaxis_title="Won orders")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(
+            agents, hide_index=True, use_container_width=True,
+            column_config={
+                "agent": "Agent", "leads": "Lead rows", "won_orders": "Won orders",
+                "revenue": st.column_config.NumberColumn("Won revenue (AED)", format="%.2f"),
+                "repeat_orders": "Repeat orders",
+                "conversion_rate": st.column_config.ProgressColumn("Conversion", min_value=0, max_value=100, format="%.1f%%"),
+            },
+        )
+
+    with tabs[3]:
+        breakdown_tabs = st.tabs(["Country", "Product", "Customer path", "Ad source"])
+        for tab, dimension, label in zip(
+            breakdown_tabs,
+            ["country", "product", "customer_path", "ad_source"],
+            ["Country", "Product", "Customer path", "Ad source"],
+        ):
+            with tab:
+                summary = dimension_summary(filtered, dimension)
+                summary[dimension] = summary[dimension].replace("", "UNMAPPED")
+                chart = summary.head(25).sort_values("won_orders")
+                fig = px.bar(chart, x="won_orders", y=dimension, orientation="h", color="conversion_rate",
+                             title=f"Won orders by {label.lower()}", text="won_orders",
+                             color_continuous_scale=["#dceff3", "#16856b"])
+                fig.update_layout(height=max(380, len(chart) * 25), xaxis_title="Won orders", yaxis_title="")
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(summary, hide_index=True, use_container_width=True)
+
+    with tabs[4]:
+        quality = quality_summary(raw, historical)
+        st.markdown("#### Reconciliation and source integrity")
+        st.dataframe(quality, hide_index=True, use_container_width=True)
+        st.info("Repeated phone numbers are intentionally retained. They can represent re-enquiries or reorders and are never used as a row-level uniqueness rule.")
+        layout_counts = historical.groupby("source_layout").size().rename("normalized_rows").reset_index()
+        st.markdown("#### Detected source layouts")
+        st.dataframe(layout_counts, hide_index=True, use_container_width=True)
+        st.markdown("#### Rows requiring review")
+        review = historical[
+            historical["phone"].eq("") | historical["agent"].eq("UNASSIGNED") | historical["exact_duplicate"]
+        ]
+        st.dataframe(review, hide_index=True, use_container_width=True)
+
+    export = excel_bytes({
+        "Normalized_Rows": filtered,
+        "Monthly_Summary": monthly_summary(filtered),
+        "Agent_Summary": dimension_summary(filtered, "agent"),
+        "Country_Summary": dimension_summary(filtered, "country"),
+        "Product_Summary": dimension_summary(filtered, "product"),
+        "Data_Quality": quality_summary(raw, historical),
+    })
+    st.download_button(
+        "Download historical analysis (.xlsx)", export,
+        file_name=f"historical_business_analysis_{start}_{end}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary", use_container_width=True,
+    )
+
+
+analysis_mode = st.sidebar.radio(
+    "Analysis mode", ["Historical business analysis", "Current operations"],
+    help="Historical mode reads the January 2025 onward CRM workbook. Current operations uses DoubleTick and 3CX uploads.",
+)
+
+if analysis_mode == "Historical business analysis":
+    st.sidebar.subheader("Historical source")
+    historical_url = st.sidebar.text_input(
+        "Google Sheet URL",
+        value=f"https://docs.google.com/spreadsheets/d/{HISTORICAL_SHEET_ID}/edit",
+    )
+    uploaded_history = st.sidebar.file_uploader(
+        "Or upload Excel", type=["xlsx", "xls"], key="historical_upload",
+        help="The uploaded workbook takes precedence over the Google Sheet URL.",
+    )
+    if st.sidebar.button("Refresh historical data", use_container_width=True):
+        load_historical_source.clear()
+        st.session_state.pop("historical_analysis", None)
+        st.rerun()
+    try:
+        with st.spinner("Loading and normalizing the historical workbook…"):
+            if uploaded_history is not None:
+                raw_history = read_historical_workbook(uploaded_history)
+                historical_data = normalize_historical_rows(raw_history)
+            else:
+                raw_history, historical_data = load_historical_source(historical_url)
+    except Exception as exc:
+        st.error(f"Could not load the historical workbook: {exc}")
+        st.stop()
+    render_historical_dashboard(raw_history, historical_data)
+    st.stop()
 
 
 with st.sidebar:
@@ -593,52 +796,6 @@ with tabs[1]:
             "orders": st.column_config.NumberColumn("Converted orders", format="%d"),
             "revenue": st.column_config.NumberColumn("Revenue (AED)", format="%.2f"),
             "conversion_rate": st.column_config.ProgressColumn("Conversion %", min_value=0, max_value=100, format="%.1f%%"),
-        },
-    )
-
-    st.markdown("#### Daily country spend and CPR")
-    st.caption("Spend comes only from the Meta reporting sheet. Leads come only from the uploaded DoubleTick report; CPR = spend ÷ leads.")
-    countries = ["UAE", "KSA", "QATAR", "BAHRAIN"]
-    daily_country = daily_dimension_performance(
-        date_filtered_joined, campaign_spend_view, "country"
-    )
-    daily_country = daily_country[
-        daily_country["country"].astype("string").str.upper().isin(
-            countries
-        )
-    ].copy()
-    daily_country = daily_country.rename(columns={"cpl": "cpr"})
-    selected_countries = st.multiselect(
-        "Filter country", countries, default=countries, key="daily_country_cpr_filter"
-    )
-    if selected_countries:
-        daily_country = daily_country[
-            daily_country["country"].astype("string").str.upper().isin(
-                selected_countries
-            )
-        ]
-    country_chart = px.bar(
-        daily_country,
-        x="date",
-        y="spend",
-        color="country",
-        barmode="group",
-        text_auto=".2s",
-        title="Daily country spend",
-        labels={"date": "Date", "spend": "Spend (AED)", "country": "Country"},
-    )
-    country_chart.update_layout(height=410, xaxis_title="", yaxis_title="Spend (AED)")
-    st.plotly_chart(country_chart, use_container_width=True)
-    st.dataframe(
-        daily_country[["date", "country", "spend", "leads", "cpr"]],
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-            "country": "Country",
-            "spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f"),
-            "leads": st.column_config.NumberColumn("Uploaded leads", format="%d"),
-            "cpr": st.column_config.NumberColumn("CPR (AED)", format="%.2f"),
         },
     )
 
