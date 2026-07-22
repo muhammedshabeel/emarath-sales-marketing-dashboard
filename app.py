@@ -13,6 +13,7 @@ from enrichment import classify_campaign, generate_fixed_zip_report
 from historical import (
     HISTORICAL_SHEET_ID,
     VENDOR_PROFIT_PER_ORDER,
+    classify_marketing_channel,
     classify_vendor,
     dimension_summary,
     monthly_summary,
@@ -347,10 +348,11 @@ def cached_monthly_lead_count(month):
 def render_historical_dashboard(raw, historical):
     # Upgrade DataFrames retained in an existing Streamlit browser session
     # when profit columns are introduced or mapping rules change.
-    required_profit_columns = {"vendor", "profit_per_order", "estimated_profit"}
+    required_profit_columns = {"vendor", "profit_per_order", "estimated_profit", "marketing_channel"}
     if not required_profit_columns.issubset(historical.columns):
         historical = historical.copy()
         historical["vendor"] = historical["product"].map(classify_vendor)
+        historical["marketing_channel"] = historical["ad_source"].map(classify_marketing_channel)
         historical["profit_per_order"] = historical["vendor"].map(VENDOR_PROFIT_PER_ORDER).fillna(0.0)
         historical["estimated_profit"] = historical["profit_per_order"].where(historical["is_won"], 0.0)
     available_months = sorted(historical["month"].dropna().unique(), reverse=True)
@@ -434,6 +436,60 @@ def render_historical_dashboard(raw, historical):
         spend_kpis[3].metric("Revenue / ad spend", f"{roas:.2f}× ROAS" if total_meta_spend else "N/A")
         if meta_errors:
             st.warning("Meta spend could not be read from every account: " + " | ".join(meta_errors))
+
+        st.markdown('<div class="section-label">Meta ads vs organic sales</div>', unsafe_allow_html=True)
+        meta_sales = won[won["marketing_channel"].eq("Meta ads")]
+        organic_sales = won[won["marketing_channel"].eq("Organic / unattributed")]
+        meta_revenue = float(meta_sales["order_value"].sum())
+        organic_revenue = float(organic_sales["order_value"].sum())
+        meta_profit = float(meta_sales["estimated_profit"].sum())
+        organic_profit = float(organic_sales["estimated_profit"].sum())
+        meta_roas = meta_revenue / total_meta_spend if total_meta_spend else 0.0
+
+        meta_panel, organic_panel = st.columns(2)
+        with meta_panel:
+            st.markdown("#### 📣 Meta-attributed sales")
+            meta_kpis = st.columns(2)
+            meta_kpis[0].metric("Won orders", f"{len(meta_sales):,}")
+            meta_kpis[1].metric("Sales revenue", f"AED {meta_revenue:,.2f}")
+            meta_kpis[2].metric("Meta spend", f"AED {total_meta_spend:,.2f}")
+            meta_kpis[3].metric("Revenue / ad spend", f"{meta_roas:.2f}× ROAS" if total_meta_spend else "N/A")
+            st.caption(f"Estimated vendor profit: AED {meta_profit:,.2f}")
+        with organic_panel:
+            st.markdown("#### 🌱 Organic / unattributed sales")
+            organic_kpis = st.columns(2)
+            organic_kpis[0].metric("Won orders", f"{len(organic_sales):,}")
+            organic_kpis[1].metric("Sales revenue", f"AED {organic_revenue:,.2f}")
+            organic_kpis[2].metric(
+                "Average order value",
+                f"AED {organic_revenue / len(organic_sales):,.2f}" if len(organic_sales) else "N/A",
+            )
+            organic_kpis[3].metric("Estimated vendor profit", f"AED {organic_profit:,.2f}")
+            st.caption("Ad Source is blank, NOT AVAILABLE, N/A, NA, NONE or '-'.")
+
+        channel_summary = pd.DataFrame([
+            {"Channel": "Meta ads", "Won orders": len(meta_sales), "Revenue (AED)": meta_revenue,
+             "Estimated profit (AED)": meta_profit, "Meta spend (AED)": total_meta_spend,
+             "ROAS": meta_roas if total_meta_spend else pd.NA},
+            {"Channel": "Organic / unattributed", "Won orders": len(organic_sales),
+             "Revenue (AED)": organic_revenue, "Estimated profit (AED)": organic_profit,
+             "Meta spend (AED)": 0.0, "ROAS": pd.NA},
+        ])
+        st.dataframe(
+            channel_summary, hide_index=True, use_container_width=True,
+            column_config={
+                "Won orders": st.column_config.NumberColumn(format="%d"),
+                "Revenue (AED)": st.column_config.NumberColumn(format="%.2f"),
+                "Estimated profit (AED)": st.column_config.NumberColumn(format="%.2f"),
+                "Meta spend (AED)": st.column_config.NumberColumn(format="%.2f"),
+                "ROAS": st.column_config.NumberColumn(format="%.2fx"),
+            },
+        )
+        st.caption(
+            f"Reconciled: {len(meta_sales) + len(organic_sales):,} channel orders = "
+            f"{len(won):,} total won orders; AED {meta_revenue + organic_revenue:,.2f} = "
+            f"AED {revenue:,.2f} total won revenue."
+        )
         overview = monthly_summary(historical)
         if authoritative_leads is not None:
             selected = overview["month"].eq(selected_month)
