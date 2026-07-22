@@ -18,6 +18,7 @@ from historical import (
     quality_summary,
     read_historical_workbook,
 )
+from meta_spend import fetch_meta_spend, monthly_spend_summary
 
 st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="wide")
 
@@ -64,6 +65,11 @@ def cached_attribution_report(phone_tuple, api_key, meta_token, waba_tuple, star
         phone_tuple, api_key, meta_token, list(waba_tuple), start_date, end_date,
         doubletick_workers=24, meta_workers=16,
     )
+
+
+@st.cache_data(ttl=1800, max_entries=12, show_spinner=False)
+def cached_meta_spend(access_token, start_date, end_date):
+    return fetch_meta_spend(access_token, start_date, end_date)
 
 
 SPEND_SHEET_ID = "1RSGCdB6UUFeFrX1mksMCBtElc9AijrKrlqR7tsP5fNg"
@@ -324,19 +330,16 @@ def load_historical_source(sheet_url):
 
 
 def render_historical_dashboard(raw, historical):
-    minimum = historical["lead_date"].min().date()
-    maximum = historical["lead_date"].max().date()
-    selected_range = st.sidebar.date_input(
-        "Historical date range", value=(minimum, maximum), min_value=minimum,
-        max_value=maximum, format="DD/MM/YYYY", key="historical_date_range",
+    available_months = sorted(historical["month"].dropna().unique(), reverse=True)
+    selected_month = st.sidebar.selectbox(
+        "Business month", available_months,
+        format_func=lambda value: pd.Period(value, freq="M").strftime("%B %Y"),
+        key="historical_business_month",
     )
-    if not isinstance(selected_range, (tuple, list)) or len(selected_range) != 2:
-        st.info("Select both a start date and an end date.")
-        st.stop()
-    start, end = selected_range
-    filtered = historical[
-        historical["lead_date"].dt.date.ge(start) & historical["lead_date"].dt.date.le(end)
-    ].copy()
+    period = pd.Period(selected_month, freq="M")
+    start = period.start_time.date()
+    end = period.end_time.date()
+    filtered = historical[historical["month"].eq(selected_month)].copy()
     if filtered.empty:
         st.warning("No historical rows exist in the selected period.")
         st.stop()
@@ -347,27 +350,51 @@ def render_historical_dashboard(raw, historical):
     conversion = len(won) / len(filtered) * 100
     revenue = float(won["order_value"].sum())
     average_order = revenue / len(won) if len(won) else 0
+    meta_token = secret("META_ACCESS_TOKEN")
+    with st.spinner("Fetching selected-period spend from Meta…"):
+        meta_spend, meta_errors = cached_meta_spend(meta_token, start, end)
+    total_meta_spend = float(meta_spend["spend"].sum()) if not meta_spend.empty else 0.0
+    cpl = total_meta_spend / len(filtered) if len(filtered) else 0.0
+    cost_per_win = total_meta_spend / len(won) if len(won) else 0.0
+    roas = revenue / total_meta_spend if total_meta_spend else 0.0
+    previous_period = period - 1
+    previous = historical[historical["month"].eq(str(previous_period))]
+    previous_won = previous[previous["is_won"]]
+    previous_revenue = float(previous_won["order_value"].sum())
+
+    def change(current, prior):
+        if not prior:
+            return None
+        return f"{(current - prior) / prior * 100:+.1f}% vs {previous_period.strftime('%b')}"
     st.markdown(
         f'<div class="hero"><h2>Historical business command centre</h2>'
-        f'<p>{len(filtered):,} source rows · {start.strftime("%d %b %Y")} to '
-        f'{end.strftime("%d %b %Y")} · repeated customer orders preserved</p></div>',
+        f'<p>{period.strftime("%B %Y")} · {len(filtered):,} lead/order rows · '
+        f'repeated customer orders preserved</p></div>',
         unsafe_allow_html=True,
     )
-    tabs = st.tabs(["Executive", "Monthly trends", "Agents", "Markets & products", "Data quality"])
+    tabs = st.tabs(["Executive", "Monthly trends", "Meta spend", "Agents", "Markets & products", "Data quality"])
 
     with tabs[0]:
         st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
         row1 = st.columns(4)
-        row1[0].metric("Lead rows", f"{len(filtered):,}")
-        row1[1].metric("Won orders", f"{len(won):,}", f"{conversion:.1f}% conversion")
-        row1[2].metric("Won revenue", f"AED {revenue:,.2f}")
+        row1[0].metric("Lead rows", f"{len(filtered):,}", change(len(filtered), len(previous)))
+        row1[1].metric("Won orders", f"{len(won):,}", change(len(won), len(previous_won)))
+        row1[2].metric("Won revenue", f"AED {revenue:,.2f}", change(revenue, previous_revenue))
         row1[3].metric("Average order value", f"AED {average_order:,.2f}")
         row2 = st.columns(4)
         row2[0].metric("First-time orders", f"{len(first_orders):,}")
         row2[1].metric("Repeat orders", f"{len(repeat_orders):,}", f"{len(repeat_orders) / len(won) * 100:.1f}% of wins" if len(won) else None)
         row2[2].metric("Repeat-order revenue", f"AED {repeat_orders['order_value'].sum():,.2f}")
         row2[3].metric("Active agents", f"{filtered.loc[filtered.agent.ne('UNASSIGNED'), 'agent'].nunique():,}")
-        overview = monthly_summary(filtered)
+        st.markdown('<div class="section-label">Meta advertising</div>', unsafe_allow_html=True)
+        spend_kpis = st.columns(4)
+        spend_kpis[0].metric("Meta spend", f"AED {total_meta_spend:,.2f}")
+        spend_kpis[1].metric("Cost per lead", f"AED {cpl:,.2f}" if total_meta_spend else "N/A")
+        spend_kpis[2].metric("Cost per won order", f"AED {cost_per_win:,.2f}" if total_meta_spend else "N/A")
+        spend_kpis[3].metric("Revenue / ad spend", f"{roas:.2f}× ROAS" if total_meta_spend else "N/A")
+        if meta_errors:
+            st.warning("Meta spend could not be read from every account: " + " | ".join(meta_errors))
+        overview = monthly_summary(historical)
         left, right = st.columns([1.55, 1])
         with left:
             trend = overview.melt(
@@ -391,6 +418,11 @@ def render_historical_dashboard(raw, historical):
 
     with tabs[1]:
         monthly = monthly_summary(filtered)
+        monthly = monthly.merge(monthly_spend_summary(meta_spend), on="month", how="left")
+        monthly["spend"] = monthly["spend"].fillna(0.0)
+        monthly["cost_per_lead"] = monthly["spend"].div(monthly["leads"].replace(0, pd.NA))
+        monthly["cost_per_won_order"] = monthly["spend"].div(monthly["won_orders"].replace(0, pd.NA))
+        monthly["roas"] = monthly["revenue"].div(monthly["spend"].replace(0, pd.NA))
         st.markdown("#### Monthly operating scorecard")
         st.dataframe(
             monthly, hide_index=True, use_container_width=True,
@@ -402,6 +434,10 @@ def render_historical_dashboard(raw, historical):
                 "first_time_orders": "First-time orders", "repeat_orders": "Repeat orders",
                 "repeat_revenue": st.column_config.NumberColumn("Repeat revenue (AED)", format="%.2f"),
                 "active_agents": "Active agents",
+                "spend": st.column_config.NumberColumn("Meta spend (AED)", format="%.2f"),
+                "cost_per_lead": st.column_config.NumberColumn("CPL (AED)", format="%.2f"),
+                "cost_per_won_order": st.column_config.NumberColumn("Cost / won order", format="%.2f"),
+                "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
             },
         )
         revenue_chart = monthly.melt(id_vars="month", value_vars=["revenue", "repeat_revenue"],
@@ -413,6 +449,20 @@ def render_historical_dashboard(raw, historical):
         st.plotly_chart(fig, use_container_width=True)
 
     with tabs[2]:
+        st.markdown("#### Meta spend by account and campaign")
+        st.caption("Spend is fetched directly from Meta Insights for the selected historical date range. Lead and order values remain sourced only from the historical workbook.")
+        if meta_spend.empty:
+            st.warning("No Meta spend was returned. Confirm META_ACCESS_TOKEN in Streamlit Secrets and that it can access all six ad accounts.")
+        else:
+            account_spend = meta_spend.groupby("account", as_index=False)["spend"].sum().sort_values("spend", ascending=False)
+            campaign_spend = meta_spend.groupby(["account", "campaign_name"], as_index=False)["spend"].sum().sort_values("spend", ascending=False)
+            fig = px.bar(account_spend, x="account", y="spend", text_auto=".2s", title="Spend by Meta ad account", color_discrete_sequence=["#176b87"])
+            fig.update_layout(xaxis_title="", yaxis_title="AED")
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(campaign_spend, hide_index=True, use_container_width=True, column_config={"spend": st.column_config.NumberColumn("Spend (AED)", format="%.2f")})
+            st.download_button("Download Meta spend detail (.csv)", meta_spend.to_csv(index=False).encode("utf-8"), file_name=f"meta_spend_{start}_{end}.csv", mime="text/csv")
+
+    with tabs[3]:
         agents = dimension_summary(filtered, "agent")
         agents = agents[agents["agent"].ne("UNASSIGNED")]
         st.markdown("#### Agent performance")
@@ -431,7 +481,7 @@ def render_historical_dashboard(raw, historical):
             },
         )
 
-    with tabs[3]:
+    with tabs[4]:
         breakdown_tabs = st.tabs(["Country", "Product", "Customer path", "Ad source"])
         for tab, dimension, label in zip(
             breakdown_tabs,
@@ -449,7 +499,7 @@ def render_historical_dashboard(raw, historical):
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(summary, hide_index=True, use_container_width=True)
 
-    with tabs[4]:
+    with tabs[5]:
         quality = quality_summary(raw, historical)
         st.markdown("#### Reconciliation and source integrity")
         st.dataframe(quality, hide_index=True, use_container_width=True)
@@ -466,6 +516,7 @@ def render_historical_dashboard(raw, historical):
     export = excel_bytes({
         "Normalized_Rows": filtered,
         "Monthly_Summary": monthly_summary(filtered),
+        "Meta_Spend": meta_spend,
         "Agent_Summary": dimension_summary(filtered, "agent"),
         "Country_Summary": dimension_summary(filtered, "country"),
         "Product_Summary": dimension_summary(filtered, "product"),
