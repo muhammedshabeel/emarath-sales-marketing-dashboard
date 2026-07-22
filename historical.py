@@ -10,6 +10,18 @@ import pandas as pd
 
 HISTORICAL_SHEET_ID = "1txj_IlJ_t8SqEzh4kJQ9eGcTkSrLW5emZ0EE0HCPspE"
 
+# Monthly lead workbooks are the authoritative source for lead volume.  The
+# aligned historical workbook remains the source for orders, revenue and
+# repeat-order analysis.  Do not deduplicate phone values: repeat enquiries
+# are valid lead rows.
+HISTORICAL_LEAD_SOURCES = {
+    "2025-01": {
+        "spreadsheet_id": "1LAJqVKrqbAsVKge-fopfhCBOWjxf8-Lt9CalRWfENdY",
+        "sheet_name": "CRM",
+        "phone_column": "PHONE",
+    },
+}
+
 
 @dataclass(frozen=True)
 class Layout:
@@ -133,6 +145,31 @@ def read_historical_workbook(source) -> pd.DataFrame:
     elif isinstance(source, str) and source.startswith(("http://", "https://")):
         source = export_url(source)
     return pd.read_excel(source, sheet_name="Sheet1", header=None, dtype=object)
+
+
+def read_monthly_lead_count(month: str) -> int | None:
+    """Return populated lead-phone rows from the authoritative monthly CRM.
+
+    Repeated phone numbers are deliberately retained.  Only blank phone cells
+    are excluded, matching the operational definition of an uploaded lead.
+    """
+    source = HISTORICAL_LEAD_SOURCES.get(str(month))
+    if not source:
+        return None
+    url = export_url(source["spreadsheet_id"])
+    frame = pd.read_excel(url, sheet_name=source["sheet_name"], dtype=object)
+    normalized = {
+        re.sub(r"[^A-Z0-9]+", "", str(column).upper()): column
+        for column in frame.columns
+    }
+    wanted = re.sub(r"[^A-Z0-9]+", "", source["phone_column"].upper())
+    phone_column = normalized.get(wanted)
+    if phone_column is None:
+        raise ValueError(
+            f"{source['sheet_name']} does not contain the expected "
+            f"{source['phone_column']} column."
+        )
+    return int(_clean_text(frame[phone_column]).ne("").sum())
 
 
 def normalize_historical_rows(raw: pd.DataFrame) -> pd.DataFrame:
