@@ -47,6 +47,32 @@ COUNTRY_PREFIXES = {
     "968": "OMAN",
 }
 
+VENDOR_PROFIT_PER_ORDER = {
+    "Scent Passion": 40.0,
+    "Oud Al Salam": 50.0,
+    "La Parfume (LPG)": 30.0,
+    "RT Fragrance": 30.0,
+    "Al Hajees": 40.0,
+    "Athiyaf": 30.0,
+}
+
+VENDOR_PRODUCT_TERMS = (
+    ("Oud Al Salam", ("AL HUDA", "ALHUDA", "PREMIUM EDITION", "LUMINUX")),
+    ("La Parfume (LPG)", ("INTENSE", "INTENS ", "OUD LOVER", "FALCON")),
+    ("RT Fragrance", ("SEVEN DAYS", "OLD MEMORIES", "OLD MEMMORIES", "MYSTERY", "PEACOCK")),
+    ("Athiyaf", ("ARCHER", "HECTOR", "VOLGA", "ASEEL", "MIRAMAR", "SHADOW FLAME", "COLLECTION OF MOODS")),
+)
+
+
+def classify_vendor(product) -> str:
+    normalized = re.sub(r"[^A-Z0-9]+", " ", str(product or "").upper()).strip()
+    for vendor, terms in VENDOR_PRODUCT_TERMS:
+        if any(re.sub(r"[^A-Z0-9]+", " ", term).strip() in normalized for term in terms):
+            return vendor
+    # Confirmed business rule: all remaining historical products belong to
+    # Scent Passion, including Ambre/Oniro, Laroche, Doller, Ferragamo and Sufi.
+    return "Scent Passion"
+
 
 def spreadsheet_id(value: str) -> str:
     value = str(value or "").strip()
@@ -161,6 +187,9 @@ def normalize_historical_rows(raw: pd.DataFrame) -> pd.DataFrame:
     data = data[data["lead_date"].dt.year.between(2025, 2100)].copy()
     data["country"] = _canonical_country(data["country_raw"], data["phone"])
     data["is_won"] = data["status"].eq("WON")
+    data["vendor"] = data["product"].map(classify_vendor)
+    data["profit_per_order"] = data["vendor"].map(VENDOR_PROFIT_PER_ORDER).fillna(0.0)
+    data["estimated_profit"] = data["profit_per_order"].where(data["is_won"], 0.0)
     data["order_id"] = data["source_order_id"].where(
         data["source_order_id"].ne(""), data["source_row"].map(lambda row: f"SOURCE-ROW-{row}")
     )
@@ -199,6 +228,7 @@ def monthly_summary(data: pd.DataFrame) -> pd.DataFrame:
             "repeat_orders": len(repeat),
             "repeat_revenue": repeat["order_value"].sum(),
             "active_agents": group.loc[group["agent"].ne("UNASSIGNED"), "agent"].nunique(),
+            "estimated_profit": won["estimated_profit"].sum(),
         })
     return pd.DataFrame(rows)
 
@@ -211,6 +241,7 @@ def dimension_summary(data: pd.DataFrame, dimension: str) -> pd.DataFrame:
         won_orders=("is_won", "sum"),
         revenue=("order_value", lambda values: values[data.loc[values.index, "is_won"]].sum()),
         repeat_orders=("order_type", lambda values: values.eq("Repeat order").sum()),
+        estimated_profit=("estimated_profit", "sum"),
     ).reset_index()
     result["conversion_rate"] = result["won_orders"].div(result["leads"]).mul(100)
     return result.sort_values(["won_orders", "leads"], ascending=False)
