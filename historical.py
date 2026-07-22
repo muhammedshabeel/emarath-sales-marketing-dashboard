@@ -86,6 +86,14 @@ def classify_vendor(product) -> str:
     return "Scent Passion"
 
 
+def classify_marketing_channel(ad_source) -> str:
+    """Split sales into Meta-attributed and organic/unattributed records."""
+    normalized = re.sub(r"\s+", " ", str(ad_source or "").strip().upper())
+    if normalized in {"", "NOT AVAILABLE", "N/A", "NA", "NONE", "-"}:
+        return "Organic / unattributed"
+    return "Meta ads"
+
+
 def spreadsheet_id(value: str) -> str:
     value = str(value or "").strip()
     match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", value)
@@ -225,6 +233,7 @@ def normalize_historical_rows(raw: pd.DataFrame) -> pd.DataFrame:
     data["country"] = _canonical_country(data["country_raw"], data["phone"])
     data["is_won"] = data["status"].eq("WON")
     data["vendor"] = data["product"].map(classify_vendor)
+    data["marketing_channel"] = data["ad_source"].map(classify_marketing_channel)
     data["profit_per_order"] = data["vendor"].map(VENDOR_PROFIT_PER_ORDER).fillna(0.0)
     data["estimated_profit"] = data["profit_per_order"].where(data["is_won"], 0.0)
     data["order_id"] = data["source_order_id"].where(
