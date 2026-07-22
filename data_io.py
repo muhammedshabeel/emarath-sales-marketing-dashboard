@@ -8,7 +8,7 @@ SYNONYMS = {
     "phone": ["phone", "mobile", "customer number", "contact number", "whatsapp number", "lead number", "number", "to"],
     "agent": ["assigned agent", "agent name", "assigned to", "owner", "sales agent", "agent", "extension name", "assigned", "from"],
     "agent_number": ["assigned user number", "agent phone", "agent number", "extension", "extension number"],
-    "datetime": ["last ctwa lead at", "call time", "created date", "assigned date", "assigned time", "created at", "lead date", "date time", "datetime", "date"],
+    "datetime": ["last message received at", "last ctwa lead at", "converted date", "conversion date", "call time", "created date", "assigned date", "assigned time", "created at", "lead date", "date time", "datetime", "date"],
     "ad_id": ["ad id", "ad_id", "source id", "source_id"],
     "campaign": ["campaign name", "meta campaign name", "meta_campaign_name", "campaign"],
     "attribution_status": ["meta lookup status", "meta_lookup_status", "dt status", "status"],
