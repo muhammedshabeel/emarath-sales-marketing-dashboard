@@ -229,9 +229,9 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     # lead for the chosen reporting period. Never discard it using historical
     # customer timestamps such as First message received at.
     leads = leads.copy()
-    # Google CRM rows are loaded from 1 July onward and are authoritative.
-    # Their dates are date-only, so an intraday DoubleTick window must not
-    # discard otherwise valid phone-matched orders.
+    # The uploaded Workpex conversion report is authoritative for orders.
+    # It is not silently trimmed again; users can upload the matching reporting
+    # period and retain legitimate repeat orders as separate rows.
     sales = sales.copy()
     # The window is user-selectable. When disabled, trust the full uploaded
     # 3CX export. Never discard local-format destinations before last-9 matching.
@@ -257,9 +257,9 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     joined["converted"] = joined.order_count.gt(0)
     joined["workpex_match_count"] = joined.workpex_match_count.fillna(0).astype(int)
     joined["workpex_found"] = joined.workpex_match_count.gt(0)
-    joined["workpex_reconciliation"] = "FOUND IN GOOGLE CRM"
-    joined.loc[~joined.workpex_found, "workpex_reconciliation"] = "NO MATCHING GOOGLE CRM ORDER"
-    joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE GOOGLE CRM ORDERS"
+    joined["workpex_reconciliation"] = "FOUND IN WORKPEX"
+    joined.loc[~joined.workpex_found, "workpex_reconciliation"] = "NO MATCHING WORKPEX CONVERSION"
+    joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE WORKPEX ORDERS"
     joined["called"] = joined.lead_region.eq("GCC") & joined.call_count.gt(0)
     joined["answered_any"] = joined.lead_region.eq("GCC") & joined.answered_calls.gt(0)
     if joined.lead_time.notna().any():
@@ -289,19 +289,19 @@ def grouped(joined, field):
 
 def qa_report(leads, sales, calls, source_ranges):
     rows = []
-    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Google CRM", sales, "phone_key"), ("3CX", calls, "call_key")):
+    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key"), ("3CX", calls, "call_key")):
         invalid = int(df[key].str.len().lt(8).sum()) if key in df else len(df)
         collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
         rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
-    rows.append({"check": "Source handling", "value": "DoubleTick + live Google CRM + 3CX", "severity": "OK"})
+    rows.append({"check": "Source handling", "value": "DoubleTick upload + Workpex upload + 3CX upload + Meta API", "severity": "OK"})
     lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key)
     gcc_leads = leads[leads.lead_region.eq("GCC")] if "lead_region" in leads else leads
     lead_call_keys = set(gcc_leads.call_key)
     call_keys = set(calls.call_key)
-    rows.append({"check": "DoubleTick leads without a Google CRM order", "value": len(lead_keys - sales_keys), "severity": "Review" if lead_keys - sales_keys else "OK"})
+    rows.append({"check": "DoubleTick leads without a Workpex conversion", "value": len(lead_keys - sales_keys), "severity": "Review" if lead_keys - sales_keys else "OK"})
     rows.append({"check": "DoubleTick leads absent from outbound GCC 3CX (last 9 digits)", "value": len(lead_call_keys - call_keys), "severity": "Review" if lead_call_keys - call_keys else "OK"})
-    rows.append({"check": "Google CRM orders from other sources", "value": int((~sales.order_from_generated_lead).sum()) if "order_from_generated_lead" in sales else len(sales_keys - lead_keys), "severity": "Review"})
+    rows.append({"check": "Workpex orders from other sources", "value": int((~sales.order_from_generated_lead).sum()) if "order_from_generated_lead" in sales else len(sales_keys - lead_keys), "severity": "Review"})
     rows.append({"check": "GCC 3CX numbers unmatched to a lead", "value": len(call_keys - lead_call_keys), "severity": "Review"})
     rows.append({"check": "Other-country DoubleTick leads shown separately", "value": int(leads.lead_region.eq("Other country").sum()) if "lead_region" in leads else 0, "severity": "Review"})
     return pd.DataFrame(rows)
