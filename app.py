@@ -19,6 +19,7 @@ from historical import (
     normalize_historical_rows,
     quality_summary,
     read_historical_workbook,
+    read_monthly_lead_count,
 )
 from meta_spend import fetch_meta_spend, monthly_spend_summary
 
@@ -338,6 +339,11 @@ def load_historical_source(sheet_url):
     return raw, normalize_historical_rows(raw)
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_monthly_lead_count(month):
+    return read_monthly_lead_count(month)
+
+
 def render_historical_dashboard(raw, historical):
     # Upgrade DataFrames retained in an existing Streamlit browser session
     # when profit columns are introduced or mapping rules change.
@@ -361,17 +367,24 @@ def render_historical_dashboard(raw, historical):
         st.warning("No historical rows exist in the selected period.")
         st.stop()
 
+    try:
+        authoritative_leads = cached_monthly_lead_count(selected_month)
+    except Exception as exc:
+        authoritative_leads = None
+        st.warning(f"Monthly CRM lead count could not be loaded: {exc}")
+    lead_count = authoritative_leads if authoritative_leads is not None else len(filtered)
+
     won = filtered[filtered["is_won"]]
     first_orders = won[won["order_type"].eq("First-time order")]
     repeat_orders = won[won["order_type"].eq("Repeat order")]
-    conversion = len(won) / len(filtered) * 100
+    conversion = len(won) / lead_count * 100 if lead_count else 0
     revenue = float(won["order_value"].sum())
     average_order = revenue / len(won) if len(won) else 0
     meta_token = secret("META_ACCESS_TOKEN")
     with st.spinner("Fetching selected-period spend from Meta…"):
         meta_spend, meta_errors = cached_meta_spend(meta_token, start, end)
     total_meta_spend = float(meta_spend["spend"].sum()) if not meta_spend.empty else 0.0
-    cpl = total_meta_spend / len(filtered) if len(filtered) else 0.0
+    cpl = total_meta_spend / lead_count if lead_count else 0.0
     cost_per_win = total_meta_spend / len(won) if len(won) else 0.0
     roas = revenue / total_meta_spend if total_meta_spend else 0.0
     estimated_profit = float(won["estimated_profit"].sum())
@@ -389,7 +402,7 @@ def render_historical_dashboard(raw, historical):
         return f"{(current - prior) / prior * 100:+.1f}% vs {previous_period.strftime('%b')}"
     st.markdown(
         f'<div class="hero"><h2>Historical business command centre</h2>'
-        f'<p>{period.strftime("%B %Y")} · {len(filtered):,} lead/order rows · '
+        f'<p>{period.strftime("%B %Y")} · {lead_count:,} leads · '
         f'repeated customer orders preserved</p></div>',
         unsafe_allow_html=True,
     )
@@ -398,7 +411,7 @@ def render_historical_dashboard(raw, historical):
     with tabs[0]:
         st.markdown('<div class="section-label">Business outcomes</div>', unsafe_allow_html=True)
         row1 = st.columns(4)
-        row1[0].metric("Lead rows", f"{len(filtered):,}", change(len(filtered), len(previous)))
+        row1[0].metric("Leads", f"{lead_count:,}", change(lead_count, len(previous)))
         row1[1].metric("Won orders", f"{len(won):,}", change(len(won), len(previous_won)))
         row1[2].metric("Won revenue", f"AED {revenue:,.2f}", change(revenue, previous_revenue))
         row1[3].metric("Average order value", f"AED {average_order:,.2f}")
@@ -422,6 +435,13 @@ def render_historical_dashboard(raw, historical):
         if meta_errors:
             st.warning("Meta spend could not be read from every account: " + " | ".join(meta_errors))
         overview = monthly_summary(historical)
+        if authoritative_leads is not None:
+            selected = overview["month"].eq(selected_month)
+            overview.loc[selected, "leads"] = lead_count
+            overview.loc[selected, "conversion_rate"] = (
+                overview.loc[selected, "won_orders"].div(lead_count).mul(100)
+                if lead_count else 0
+            )
         left, right = st.columns([1.55, 1])
         with left:
             trend = overview.melt(
