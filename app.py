@@ -28,7 +28,9 @@ st.markdown("""
 .block-container{padding-top:1.25rem;max-width:1480px}h1,h2,h3{letter-spacing:-.035em;color:#132238}
 [data-testid="stSidebar"]{background:#fff;border-right:1px solid #e6eaf0}
 [data-testid="stMetric"]{background:#fff;border:1px solid #e6eaf0;padding:18px;border-radius:18px;box-shadow:0 7px 24px rgba(23,42,79,.055)}
-[data-testid="stMetricLabel"]{color:#667085;font-weight:650}[data-testid="stMetricValue"]{color:#132238;font-weight:750}
+[data-testid="stMetricLabel"]{color:#667085;font-weight:650}
+[data-testid="stMetricValue"]{color:#132238;font-weight:750;font-size:clamp(1.55rem,2.15vw,2.65rem);white-space:nowrap;overflow:visible;text-overflow:clip;letter-spacing:-.04em}
+[data-testid="stMetricValue"]>div{white-space:nowrap;overflow:visible;text-overflow:clip}
 .hero{padding:26px 30px;border-radius:24px;background:linear-gradient(120deg,#102a43,#176b87);color:white;margin:.4rem 0 1.2rem;box-shadow:0 16px 40px rgba(16,42,67,.18)}
 .hero h2{color:white;margin:0 0 7px}.hero p{margin:0;color:#d9edf4}
 .section-label{font-size:.75rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#d4a017;margin:1.4rem 0 .5rem}
