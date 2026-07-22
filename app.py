@@ -352,7 +352,7 @@ def render_historical_dashboard(raw, historical):
     if not required_profit_columns.issubset(historical.columns):
         historical = historical.copy()
         historical["vendor"] = historical["product"].map(classify_vendor)
-        historical["marketing_channel"] = historical["ad_source"].map(classify_marketing_channel)
+        historical["marketing_channel"] = historical["customer_path"].map(classify_marketing_channel)
         historical["profit_per_order"] = historical["vendor"].map(VENDOR_PROFIT_PER_ORDER).fillna(0.0)
         historical["estimated_profit"] = historical["profit_per_order"].where(historical["is_won"], 0.0)
     available_months = sorted(historical["month"].dropna().unique(), reverse=True)
@@ -439,7 +439,7 @@ def render_historical_dashboard(raw, historical):
 
         st.markdown('<div class="section-label">Meta ads vs organic sales</div>', unsafe_allow_html=True)
         meta_sales = won[won["marketing_channel"].eq("Meta ads")]
-        organic_sales = won[won["marketing_channel"].eq("Organic / unattributed")]
+        organic_sales = won[won["marketing_channel"].eq("Organic / other")]
         meta_revenue = float(meta_sales["order_value"].sum())
         organic_revenue = float(organic_sales["order_value"].sum())
         meta_profit = float(meta_sales["estimated_profit"].sum())
@@ -456,7 +456,7 @@ def render_historical_dashboard(raw, historical):
             meta_kpis[3].metric("Revenue / ad spend", f"{meta_roas:.2f}× ROAS" if total_meta_spend else "N/A")
             st.caption(f"Estimated vendor profit: AED {meta_profit:,.2f}")
         with organic_panel:
-            st.markdown("#### 🌱 Organic / unattributed sales")
+            st.markdown("#### 🌱 Organic / other sales")
             organic_kpis = st.columns(2)
             organic_kpis[0].metric("Won orders", f"{len(organic_sales):,}")
             organic_kpis[1].metric("Sales revenue", f"AED {organic_revenue:,.2f}")
@@ -465,13 +465,13 @@ def render_historical_dashboard(raw, historical):
                 f"AED {organic_revenue / len(organic_sales):,.2f}" if len(organic_sales) else "N/A",
             )
             organic_kpis[3].metric("Estimated vendor profit", f"AED {organic_profit:,.2f}")
-            st.caption("Ad Source is blank, NOT AVAILABLE, N/A, NA, NONE or '-'.")
+            st.caption("Customer Path is not Lead, Re-Order, Broadcast or Lead&Re-Order.")
 
         channel_summary = pd.DataFrame([
             {"Channel": "Meta ads", "Won orders": len(meta_sales), "Revenue (AED)": meta_revenue,
              "Estimated profit (AED)": meta_profit, "Meta spend (AED)": total_meta_spend,
              "ROAS": meta_roas if total_meta_spend else pd.NA},
-            {"Channel": "Organic / unattributed", "Won orders": len(organic_sales),
+            {"Channel": "Organic / other", "Won orders": len(organic_sales),
              "Revenue (AED)": organic_revenue, "Estimated profit (AED)": organic_profit,
              "Meta spend (AED)": 0.0, "ROAS": pd.NA},
         ])
