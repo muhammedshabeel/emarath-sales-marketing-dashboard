@@ -12,6 +12,8 @@ from data_io import choose_best_sheet, detect_column, read_upload
 from enrichment import classify_campaign, generate_fixed_zip_report
 from historical import (
     HISTORICAL_SHEET_ID,
+    VENDOR_PROFIT_PER_ORDER,
+    classify_vendor,
     dimension_summary,
     monthly_summary,
     normalize_historical_rows,
@@ -51,6 +53,11 @@ if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
+
+HISTORICAL_SCHEMA_VERSION = 2
+if st.session_state.get("historical_schema_version") != HISTORICAL_SCHEMA_VERSION:
+    st.session_state.pop("historical_analysis", None)
+    st.session_state["historical_schema_version"] = HISTORICAL_SCHEMA_VERSION
 
 st_autorefresh(interval=300_000, limit=None, key="google_crm_order_refresh")
 
@@ -332,6 +339,14 @@ def load_historical_source(sheet_url):
 
 
 def render_historical_dashboard(raw, historical):
+    # Upgrade DataFrames retained in an existing Streamlit browser session
+    # when profit columns are introduced or mapping rules change.
+    required_profit_columns = {"vendor", "profit_per_order", "estimated_profit"}
+    if not required_profit_columns.issubset(historical.columns):
+        historical = historical.copy()
+        historical["vendor"] = historical["product"].map(classify_vendor)
+        historical["profit_per_order"] = historical["vendor"].map(VENDOR_PROFIT_PER_ORDER).fillna(0.0)
+        historical["estimated_profit"] = historical["profit_per_order"].where(historical["is_won"], 0.0)
     available_months = sorted(historical["month"].dropna().unique(), reverse=True)
     selected_month = st.sidebar.selectbox(
         "Business month", available_months,
