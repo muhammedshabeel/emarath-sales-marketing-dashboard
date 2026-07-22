@@ -480,7 +480,7 @@ def render_historical_dashboard(raw, historical):
 
 
 analysis_mode = st.sidebar.radio(
-    "Analysis mode", ["Historical business analysis", "Current operations"],
+    "Analysis mode", ["Current operations", "Historical business analysis"],
     help="Historical mode reads the January 2025 onward CRM workbook. Current operations uses DoubleTick and 3CX uploads.",
 )
 
@@ -497,17 +497,28 @@ if analysis_mode == "Historical business analysis":
     if st.sidebar.button("Refresh historical data", use_container_width=True):
         load_historical_source.clear()
         st.session_state.pop("historical_analysis", None)
-        st.rerun()
-    try:
-        with st.spinner("Loading and normalizing the historical workbook…"):
-            if uploaded_history is not None:
-                raw_history = read_historical_workbook(uploaded_history)
-                historical_data = normalize_historical_rows(raw_history)
-            else:
-                raw_history, historical_data = load_historical_source(historical_url)
-    except Exception as exc:
-        st.error(f"Could not load the historical workbook: {exc}")
+    load_requested = st.sidebar.button(
+        "Load historical dashboard", type="primary", use_container_width=True
+    )
+    if load_requested:
+        try:
+            with st.spinner("Loading and normalizing the historical workbook…"):
+                if uploaded_history is not None:
+                    raw_history = read_historical_workbook(uploaded_history)
+                    historical_data = normalize_historical_rows(raw_history)
+                else:
+                    raw_history, historical_data = load_historical_source(historical_url)
+                st.session_state["historical_analysis"] = (raw_history, historical_data)
+        except Exception as exc:
+            st.error(f"Could not load the historical workbook: {exc}")
+            st.stop()
+    if "historical_analysis" not in st.session_state:
+        st.info(
+            "Historical data is loaded only when requested so the app starts quickly. "
+            "Choose the Google Sheet or upload an Excel file, then click Load historical dashboard."
+        )
         st.stop()
+    raw_history, historical_data = st.session_state["historical_analysis"]
     render_historical_dashboard(raw_history, historical_data)
     st.stop()
 
