@@ -1,6 +1,6 @@
 import pandas as pd
 
-from historical import normalize_historical_rows
+from historical import classify_vendor, normalize_historical_rows
 
 
 def _raw(rows=3):
@@ -30,6 +30,15 @@ def test_mixed_layouts_and_repeat_phone_rows_are_preserved():
     assert len(data) == 3
     assert data["is_won"].sum() == 2
     assert list(data.loc[data["is_won"], "order_type"]) == ["First-time order", "Repeat order"]
+
+
+def test_confirmed_vendor_profit_rules_and_fallback():
+    assert classify_vendor("Oud Lovers-LPG") == "La Parfume (LPG)"
+    assert classify_vendor("Mystery Combo") == "RT Fragrance"
+    assert classify_vendor("Peacock Collection") == "RT Fragrance"
+    assert classify_vendor("Volga Combo") == "Athiyaf"
+    assert classify_vendor("Premium Edition") == "Oud Al Salam"
+    assert classify_vendor("Ambre + Oniro") == "Scent Passion"
     assert data.loc[1, "order_id"] == "SOURCE-ROW-2"
     assert data.loc[2, "order_id"] == "TRACK-1"
 
