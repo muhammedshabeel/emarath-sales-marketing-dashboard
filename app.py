@@ -47,9 +47,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Sales & Marketing Intelligence")
-st.caption("DoubleTick leads × uploaded Workpex conversions × uploaded 3CX calls × live Meta spend")
+st.caption("DoubleTick leads × uploaded Workpex conversions × optional 3CX calls × live Meta spend")
 
-ANALYSIS_SCHEMA_VERSION = 27
+ANALYSIS_SCHEMA_VERSION = 28
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -640,26 +640,31 @@ with st.sidebar:
     wp_tz = st.selectbox("Workpex", tz_options, 0)
     cx_tz = st.selectbox("3CX", tz_options, 0)
 
-st.subheader("1. Upload the three source reports")
+st.subheader("1. Upload source reports")
 c1, c2, c3 = st.columns(3)
 dt_file = c1.file_uploader("DoubleTick assignments", type=["csv", "xlsx", "xls", "zip"], help="Customer number + assigned agent number only")
 wp_file = c2.file_uploader("Workpex converted orders", type=["csv", "xlsx", "xls", "zip"])
-cx_file = c3.file_uploader("3CX calls", type=["csv", "xlsx", "xls", "zip"])
+cx_file = c3.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "zip"], help="Leave blank to generate the sales and marketing report without call KPIs.")
 
-if not all((dt_file, wp_file, cx_file)):
-    st.info("Upload DoubleTick leads, Workpex converted orders and 3CX calls. Meta spend is fetched directly with META_ACCESS_TOKEN.")
+if not all((dt_file, wp_file)):
+    st.info("Upload DoubleTick leads and Workpex converted orders. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")
     st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel. The app will propose column mappings before processing.")
     st.stop()
 
 try:
-    dt_frames, wp_frames, cx_frames = read_upload(dt_file), read_upload(wp_file), read_upload(cx_file)
+    dt_frames = read_upload(dt_file)
+    wp_frames = read_upload(wp_file)
+    cx_frames = read_upload(cx_file) if cx_file is not None else None
 except Exception as exc:
     st.error(f"Could not read an upload: {exc}"); st.stop()
 
 st.subheader("2. Confirm sheets and columns")
-tabs = st.tabs(["DoubleTick assignment mapping", "Workpex mapping", "3CX mapping"])
+source_names = ["DoubleTick", "Workpex"] + (["3CX"] if cx_frames is not None else [])
+source_frames = [dt_frames, wp_frames] + ([cx_frames] if cx_frames is not None else [])
+tab_labels = [f"{name} mapping" if name != "DoubleTick" else "DoubleTick assignment mapping" for name in source_names]
+tabs = st.tabs(tab_labels)
 selected = {}
-for tab, name, frames in zip(tabs, ["DoubleTick", "Workpex", "3CX"], [dt_frames, wp_frames, cx_frames]):
+for tab, name, frames in zip(tabs, source_names, source_frames):
     with tab:
         best, _ = choose_best_sheet(frames, name.lower())
         sheet = st.selectbox("Report sheet/file", list(frames), index=list(frames).index(best), key=f"sheet_{name}")
@@ -732,7 +737,7 @@ st.subheader("3. Integrated fixed ZIP attribution engine")
 api_key = secret("DOUBLETICK_API_KEY")
 meta_token = secret("META_ACCESS_TOKEN")
 st.caption("Every build replaces the integrated ZIP engine's phone list with the current DoubleTick all-customer Phone number column. Marketing is then calculated only from the newly generated DoubleTick Ad/Meta report and the product/vendor reference.")
-submitted = st.button("Build dashboard", type="primary", use_container_width=True)
+submitted = st.button("Generate report", type="primary", use_container_width=True)
 
 if submitted:
     with st.spinner("Normalizing and matching reports…"):
@@ -743,7 +748,13 @@ if submitted:
         sales["order_source"] = sales["order_from_generated_lead"].map({
             True: "Generated DoubleTick lead", False: "Other / uploaded Workpex"
         })
-        calls = normalize_calls(*selected["3CX"], cx_tz, report_tz)
+        if "3CX" in selected:
+            calls = normalize_calls(*selected["3CX"], cx_tz, report_tz)
+        else:
+            calls = pd.DataFrame(columns=[
+                "phone_key", "call_key", "call_number", "call_time", "call_agent",
+                "call_status", "duration_seconds", "answered",
+            ])
         agent_crosswalk = agent_directory_frame()
         wabas = ["".join(filter(str.isdigit, x)) for x in secret("DOUBLETICK_WABA_NUMBERS", "971521367907").split(",") if x.strip()]
     if not api_key or not meta_token:
@@ -790,7 +801,7 @@ if joined.empty:
 # duplicate phone numbers: each uploaded row represents one reported lead.
 doubletick_report = joined.copy()
 
-if len({dt_tz, wp_tz, cx_tz}) > 1:
+if len({dt_tz, wp_tz} | ({cx_tz} if cx_file is not None else set())) > 1:
     st.warning("Source timezones differ. Times were converted to the selected report timezone; verify those source timezone selections.")
 
 st.markdown(f"""<div class="hero"><h2>Performance command centre</h2><p>{len(doubletick_report):,} DoubleTick report leads · {pd.Timestamp(call_start).strftime('%d %b, %I:%M %p')} to {pd.Timestamp(call_end).strftime('%d %b, %I:%M %p')} · Dubai time</p></div>""", unsafe_allow_html=True)
