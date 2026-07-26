@@ -1,4 +1,4 @@
-name: Persist Generate report action
+name: Fix historical KPI layout
 
 on:
   workflow_dispatch:
@@ -22,19 +22,18 @@ jobs:
           path = Path('app.py')
           text = path.read_text(encoding='utf-8')
 
-          old = '''generate_requested = st.button("Generate report", type="primary", use_container_width=True)\nif not generate_requested:\n    st.caption("Files are ready. Click Generate report to start reading and processing them.")\n    st.stop()'''
-          new = '''if "generate_requested" not in st.session_state:\n    st.session_state["generate_requested"] = False\n\ndef start_generation():\n    st.session_state["generate_requested"] = True\n\nst.button(\n    "Generate report",\n    type="primary",\n    use_container_width=True,\n    on_click=start_generation,\n    disabled=st.session_state["generate_requested"],\n)\nif not st.session_state["generate_requested"]:\n    st.caption("Files are ready. Click Generate report to start reading and processing them.")\n    st.stop()\n\nst.info("Report generation started. Reading the uploaded files now — the 141 MB Workpex file can take several minutes.")'''
+          old_meta = '            meta_kpis = st.columns(2)'
+          new_meta = '            meta_kpis = st.columns(4)'
+          old_organic = '            organic_kpis = st.columns(2)'
+          new_organic = '            organic_kpis = st.columns(4)'
 
-          old_submit = 'submitted = generate_requested'
-          new_submit = 'submitted = st.session_state.get("generate_requested", False)'
+          if old_meta not in text:
+              raise SystemExit('Meta KPI layout line not found')
+          if old_organic not in text:
+              raise SystemExit('Organic KPI layout line not found')
 
-          if old not in text:
-              raise SystemExit('Generate button block not found')
-          if old_submit not in text:
-              raise SystemExit('Submitted assignment not found')
-
-          text = text.replace(old, new, 1)
-          text = text.replace(old_submit, new_submit, 1)
+          text = text.replace(old_meta, new_meta, 1)
+          text = text.replace(old_organic, new_organic, 1)
           path.write_text(text, encoding='utf-8')
       - name: Validate Python syntax
         run: python -m py_compile app.py
@@ -43,5 +42,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app.py
-          git commit -m "Persist report generation while parsing large uploads"
+          git commit -m "Fix historical KPI column counts"
           git push
