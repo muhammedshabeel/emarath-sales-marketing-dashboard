@@ -651,10 +651,24 @@ if not all((dt_file, wp_file)):
     st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel.")
     st.stop()
 
-generate_requested = st.button("Generate report", type="primary", use_container_width=True)
-if not generate_requested:
+if "generate_requested" not in st.session_state:
+    st.session_state["generate_requested"] = False
+
+def start_generation():
+    st.session_state["generate_requested"] = True
+
+st.button(
+    "Generate report",
+    type="primary",
+    use_container_width=True,
+    on_click=start_generation,
+    disabled=st.session_state["generate_requested"],
+)
+if not st.session_state["generate_requested"]:
     st.caption("Files are ready. Click Generate report to start reading and processing them.")
     st.stop()
+
+st.info("Report generation started. Reading the uploaded files now — the 141 MB Workpex file can take several minutes.")
 
 try:
     dt_frames = read_upload(dt_file)
@@ -742,7 +756,7 @@ st.subheader("3. Integrated fixed ZIP attribution engine")
 api_key = secret("DOUBLETICK_API_KEY")
 meta_token = secret("META_ACCESS_TOKEN")
 st.caption("Every build replaces the integrated ZIP engine's phone list with the current DoubleTick all-customer Phone number column. Marketing is then calculated only from the newly generated DoubleTick Ad/Meta report and the product/vendor reference.")
-submitted = generate_requested
+submitted = st.session_state.get("generate_requested", False)
 
 if submitted:
     with st.spinner("Normalizing and matching reports…"):
