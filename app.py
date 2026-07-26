@@ -372,7 +372,7 @@ def render_historical_dashboard(raw, historical):
         meta_panel, organic_panel = st.columns(2)
         with meta_panel:
             st.markdown("#### 📣 Meta-attributed sales")
-            meta_kpis = st.columns(2)
+            meta_kpis = st.columns(4)
             meta_kpis[0].metric("Won orders", f"{len(meta_sales):,}")
             meta_kpis[1].metric("Sales revenue", f"AED {meta_revenue:,.2f}")
             meta_kpis[2].metric("Meta spend", f"AED {total_meta_spend:,.2f}")
@@ -380,7 +380,7 @@ def render_historical_dashboard(raw, historical):
             st.caption(f"Estimated vendor profit: AED {meta_profit:,.2f}")
         with organic_panel:
             st.markdown("#### 🌱 Organic / other sales")
-            organic_kpis = st.columns(2)
+            organic_kpis = st.columns(4)
             organic_kpis[0].metric("Won orders", f"{len(organic_sales):,}")
             organic_kpis[1].metric("Sales revenue", f"AED {organic_revenue:,.2f}")
             organic_kpis[2].metric(
