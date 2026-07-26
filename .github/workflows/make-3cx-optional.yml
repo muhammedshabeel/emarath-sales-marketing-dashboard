@@ -1,4 +1,4 @@
-name: Fix historical KPI layout
+name: Wire historical business dashboard
 
 on:
   workflow_dispatch:
@@ -18,29 +18,97 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           path = Path('app.py')
           text = path.read_text(encoding='utf-8')
 
-          old_meta = '            meta_kpis = st.columns(2)'
-          new_meta = '            meta_kpis = st.columns(4)'
-          old_organic = '            organic_kpis = st.columns(2)'
-          new_organic = '            organic_kpis = st.columns(4)'
+          import_anchor = 'from meta_spend import META_AD_ACCOUNTS, fetch_meta_spend, monthly_spend_summary\n'
+          import_line = 'from historical_business import load_historical_business, render_historical_business\n'
+          if import_line not in text:
+              if import_anchor not in text:
+                  raise SystemExit('Import anchor not found')
+              text = text.replace(import_anchor, import_anchor + import_line, 1)
 
-          if old_meta not in text:
-              raise SystemExit('Meta KPI layout line not found')
-          if old_organic not in text:
-              raise SystemExit('Organic KPI layout line not found')
+          text = text.replace(
+              'help="Historical mode reads the January 2025 onward CRM workbook. Current operations uses DoubleTick and 3CX uploads.",',
+              'help="Historical mode connects monthly leads sheets, agent-created orders, Sales CRM final outcomes and live Meta spend. Current operations uses DoubleTick and Workpex.",',
+              1,
+          )
 
-          text = text.replace(old_meta, new_meta, 1)
-          text = text.replace(old_organic, new_organic, 1)
+          pattern = re.compile(
+              r'if analysis_mode == "Historical business analysis":\n.*?\n\nwith st\.sidebar:',
+              re.S,
+          )
+          replacement = '''if analysis_mode == "Historical business analysis":
+    st.sidebar.subheader("Historical business period")
+    selected_year = st.sidebar.selectbox("Year", [2024, 2025, 2026], index=1)
+    max_month = 4 if selected_year == 2026 else 12
+    selected_month_number = st.sidebar.selectbox(
+        "Month",
+        list(range(1, max_month + 1)),
+        index=max_month - 1,
+        format_func=lambda value: pd.Timestamp(2000, value, 1).strftime("%B"),
+    )
+    selected_historical_month = f"{selected_year}-{selected_month_number:02d}"
+
+    if st.sidebar.button("Refresh historical sources", use_container_width=True):
+        load_historical_business.clear()
+        st.session_state.pop("historical_business_data", None)
+
+    load_requested = st.sidebar.button(
+        "Load historical dashboard", type="primary", use_container_width=True
+    )
+    if load_requested:
+        try:
+            with st.spinner("Loading monthly leads and Sales CRM history…"):
+                st.session_state["historical_business_data"] = load_historical_business()
+        except Exception as exc:
+            st.error(f"Could not load historical business sources: {exc}")
+            st.stop()
+
+    if "historical_business_data" not in st.session_state:
+        st.info(
+            "Select the year and month, then click Load historical dashboard. "
+            "The dashboard connects monthly lead sheets, agent-created orders, Sales CRM outcomes and live Meta spend."
+        )
+        st.stop()
+
+    historical_leads, historical_crm = st.session_state["historical_business_data"]
+    period = pd.Period(selected_historical_month, freq="M")
+    meta_token = secret("META_ACCESS_TOKEN")
+    with st.spinner("Fetching matching Meta spend…"):
+        historical_meta_spend, historical_meta_errors = cached_meta_spend(
+            meta_token,
+            period.start_time.date(),
+            period.end_time.date(),
+            configured_meta_accounts(),
+        )
+    render_historical_business(
+        historical_leads,
+        historical_crm,
+        historical_meta_spend,
+        selected_historical_month,
+    )
+    if historical_meta_errors:
+        st.warning("Meta spend could not be read from every account: " + " | ".join(historical_meta_errors))
+    st.stop()
+
+
+with st.sidebar:'''
+
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'Historical mode block replacement count: {count}')
+
+          text = text.replace('HISTORICAL_SCHEMA_VERSION = 2', 'HISTORICAL_SCHEMA_VERSION = 3', 1)
           path.write_text(text, encoding='utf-8')
       - name: Validate Python syntax
-        run: python -m py_compile app.py
-      - name: Commit dashboard fix
+        run: python -m py_compile app.py historical_business.py
+      - name: Commit dashboard integration
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app.py
-          git commit -m "Fix historical KPI column counts"
+          git add app.py historical_business.py
+          git commit -m "Connect historical leads, Sales CRM and Meta spend dashboard"
           git push
