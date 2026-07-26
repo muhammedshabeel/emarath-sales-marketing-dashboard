@@ -648,7 +648,12 @@ cx_file = c3.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "
 
 if not all((dt_file, wp_file)):
     st.info("Upload DoubleTick leads and Workpex converted orders. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")
-    st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel. The app will propose column mappings before processing.")
+    st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel.")
+    st.stop()
+
+generate_requested = st.button("Generate report", type="primary", use_container_width=True)
+if not generate_requested:
+    st.caption("Files are ready. Click Generate report to start reading and processing them.")
     st.stop()
 
 try:
@@ -737,7 +742,7 @@ st.subheader("3. Integrated fixed ZIP attribution engine")
 api_key = secret("DOUBLETICK_API_KEY")
 meta_token = secret("META_ACCESS_TOKEN")
 st.caption("Every build replaces the integrated ZIP engine's phone list with the current DoubleTick all-customer Phone number column. Marketing is then calculated only from the newly generated DoubleTick Ad/Meta report and the product/vendor reference.")
-submitted = st.button("Generate report", type="primary", use_container_width=True)
+submitted = generate_requested
 
 if submitted:
     with st.spinner("Normalizing and matching reports…"):
