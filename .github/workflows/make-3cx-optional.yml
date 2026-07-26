@@ -1,4 +1,4 @@
-name: Show Generate report immediately
+name: Persist Generate report action
 
 on:
   workflow_dispatch:
@@ -22,19 +22,19 @@ jobs:
           path = Path('app.py')
           text = path.read_text(encoding='utf-8')
 
-          old_upload = '''cx_file = c3.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "zip"], help="Leave blank to generate the sales and marketing report without call KPIs.")\n\nif not all((dt_file, wp_file)):\n    st.info("Upload DoubleTick leads and Workpex converted orders. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")\n    st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel. The app will propose column mappings before processing.")\n    st.stop()'''
-          new_upload = '''cx_file = c3.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "zip"], help="Leave blank to generate the sales and marketing report without call KPIs.")\n\nif not all((dt_file, wp_file)):\n    st.info("Upload DoubleTick leads and Workpex converted orders. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")\n    st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel.")\n    st.stop()\n\ngenerate_requested = st.button("Generate report", type="primary", use_container_width=True)\nif not generate_requested:\n    st.caption("Files are ready. Click Generate report to start reading and processing them.")\n    st.stop()'''
+          old = '''generate_requested = st.button("Generate report", type="primary", use_container_width=True)\nif not generate_requested:\n    st.caption("Files are ready. Click Generate report to start reading and processing them.")\n    st.stop()'''
+          new = '''if "generate_requested" not in st.session_state:\n    st.session_state["generate_requested"] = False\n\ndef start_generation():\n    st.session_state["generate_requested"] = True\n\nst.button(\n    "Generate report",\n    type="primary",\n    use_container_width=True,\n    on_click=start_generation,\n    disabled=st.session_state["generate_requested"],\n)\nif not st.session_state["generate_requested"]:\n    st.caption("Files are ready. Click Generate report to start reading and processing them.")\n    st.stop()\n\nst.info("Report generation started. Reading the uploaded files now — the 141 MB Workpex file can take several minutes.")'''
 
-          old_button = 'submitted = st.button("Generate report", type="primary", use_container_width=True)'
-          new_button = 'submitted = generate_requested'
+          old_submit = 'submitted = generate_requested'
+          new_submit = 'submitted = st.session_state.get("generate_requested", False)'
 
-          if old_upload not in text:
-              raise SystemExit('Upload block not found')
-          if old_button not in text:
-              raise SystemExit('Existing Generate report button not found')
+          if old not in text:
+              raise SystemExit('Generate button block not found')
+          if old_submit not in text:
+              raise SystemExit('Submitted assignment not found')
 
-          text = text.replace(old_upload, new_upload, 1)
-          text = text.replace(old_button, new_button, 1)
+          text = text.replace(old, new, 1)
+          text = text.replace(old_submit, new_submit, 1)
           path.write_text(text, encoding='utf-8')
       - name: Validate Python syntax
         run: python -m py_compile app.py
@@ -43,5 +43,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app.py
-          git commit -m "Show Generate report before parsing large uploads"
+          git commit -m "Persist report generation while parsing large uploads"
           git push
