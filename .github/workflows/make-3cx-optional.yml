@@ -1,6 +1,7 @@
 name: Make 3CX optional
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - '.github/workflows/make-3cx-optional.yml'
