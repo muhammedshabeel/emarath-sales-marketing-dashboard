@@ -1,0 +1,73 @@
+name: Make 3CX optional
+
+on:
+  push:
+    paths:
+      - '.github/workflows/make-3cx-optional.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch app.py
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('app.py')
+          text = path.read_text(encoding='utf-8')
+
+          replacements = [
+              (
+                  'st.caption("DoubleTick leads × uploaded Workpex conversions × uploaded 3CX calls × live Meta spend")',
+                  'st.caption("DoubleTick leads × uploaded Workpex conversions × optional 3CX calls × live Meta spend")',
+              ),
+              (
+                  'ANALYSIS_SCHEMA_VERSION = 27',
+                  'ANALYSIS_SCHEMA_VERSION = 28',
+              ),
+              (
+                  'st.subheader("1. Upload the three source reports")',
+                  'st.subheader("1. Upload source reports")',
+              ),
+              (
+                  'cx_file = c3.file_uploader("3CX calls", type=["csv", "xlsx", "xls", "zip"])',
+                  'cx_file = c3.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "zip"], help="Leave blank to generate the sales and marketing report without call KPIs.")',
+              ),
+              (
+                  '''if not all((dt_file, wp_file, cx_file)):\n    st.info("Upload DoubleTick leads, Workpex converted orders and 3CX calls. Meta spend is fetched directly with META_ACCESS_TOKEN.")\n    st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel. The app will propose column mappings before processing.")\n    st.stop()\n\ntry:\n    dt_frames, wp_frames, cx_frames = read_upload(dt_file), read_upload(wp_file), read_upload(cx_file)\nexcept Exception as exc:\n    st.error(f"Could not read an upload: {exc}"); st.stop()\n\nst.subheader("2. Confirm sheets and columns")\ntabs = st.tabs(["DoubleTick assignment mapping", "Workpex mapping", "3CX mapping"])\nselected = {}\nfor tab, name, frames in zip(tabs, ["DoubleTick", "Workpex", "3CX"], [dt_frames, wp_frames, cx_frames]):''',
+                  '''if not all((dt_file, wp_file)):\n    st.info("Upload DoubleTick leads and Workpex converted orders. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")\n    st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel. The app will propose column mappings before processing.")\n    st.stop()\n\ntry:\n    dt_frames = read_upload(dt_file)\n    wp_frames = read_upload(wp_file)\n    cx_frames = read_upload(cx_file) if cx_file is not None else None\nexcept Exception as exc:\n    st.error(f"Could not read an upload: {exc}"); st.stop()\n\nst.subheader("2. Confirm sheets and columns")\nsource_names = ["DoubleTick", "Workpex"] + (["3CX"] if cx_frames is not None else [])\nsource_frames = [dt_frames, wp_frames] + ([cx_frames] if cx_frames is not None else [])\ntab_labels = [f"{name} mapping" if name != "DoubleTick" else "DoubleTick assignment mapping" for name in source_names]\ntabs = st.tabs(tab_labels)\nselected = {}\nfor tab, name, frames in zip(tabs, source_names, source_frames):''',
+              ),
+              (
+                  'submitted = st.button("Build dashboard", type="primary", use_container_width=True)',
+                  'submitted = st.button("Generate report", type="primary", use_container_width=True)',
+              ),
+              (
+                  '        calls = normalize_calls(*selected["3CX"], cx_tz, report_tz)',
+                  '''        if "3CX" in selected:\n            calls = normalize_calls(*selected["3CX"], cx_tz, report_tz)\n        else:\n            calls = pd.DataFrame(columns=[\n                "phone_key", "call_key", "call_number", "call_time", "call_agent",\n                "call_status", "duration_seconds", "answered",\n            ])''',
+              ),
+              (
+                  'if len({dt_tz, wp_tz, cx_tz}) > 1:',
+                  'if len({dt_tz, wp_tz} | ({cx_tz} if cx_file is not None else set())) > 1:',
+              ),
+          ]
+
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f'Expected app.py block not found:\n{old[:180]}')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+      - name: Validate Python syntax
+        run: python -m py_compile app.py
+      - name: Commit dashboard fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          git commit -m "Make 3CX optional and expose Generate report button"
+          git push
