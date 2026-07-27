@@ -1,4 +1,4 @@
-name: Persist historical dashboard data
+name: Fix historical CRM matching
 
 on:
   workflow_dispatch:
@@ -15,81 +15,82 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Make historical cache persistent
+      - name: Fix unalignable boolean index in CRM matching
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          history_path = Path('historical_business.py')
-          history = history_path.read_text(encoding='utf-8')
-          history = history.replace(
-              '@st.cache_data(ttl=21600, show_spinner=False)\ndef load_historical_business()',
-              '@st.cache_resource(show_spinner=False)\ndef load_historical_business()',
-              1,
-          )
-          history_path.write_text(history, encoding='utf-8')
+          path = Path('historical_business.py')
+          text = path.read_text(encoding='utf-8')
 
-          page_path = Path('pages/01_Historical_Business.py')
-          page = page_path.read_text(encoding='utf-8')
-          old = '''if "historical_business_data" not in st.session_state:
-    try:
-        with st.spinner("Loading the 2024–2026 monthly leads and Sales CRM sheets…"):
-            st.session_state["historical_business_data"] = load_historical_business()
-    except Exception as exc:
-        st.error(f"Could not load historical business sources: {exc}")
-        st.stop()
+          old = '''    missing = result["crm_outcome"].isna() & result["phone_2"].ne("")
+    if missing.any():
+        secondary = leads.loc[missing].merge(
+            crm_one[["month", "match_phone", "crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]],
+            left_on=["month", "phone_2"], right_on=["month", "match_phone"], how="left",
+        )
+        for column in ["crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]:
+            result.loc[missing, column] = secondary[column].to_numpy()'''
 
-historical_leads, historical_crm = st.session_state["historical_business_data"]'''
-          new = '''try:
-    with st.spinner("Loading historical data once and keeping it available in memory…"):
-        historical_leads, historical_crm = load_historical_business()
-except Exception as exc:
-    st.error(f"Could not load historical business sources: {exc}")
-    st.stop()'''
-          if old in page:
-              page = page.replace(old, new, 1)
-          page = page.replace(
-              'status_col.info("Lead count for Meta CPL uses only Customer Path = LEAD. Missed Lead, Broadcast and Re-Order remain separate business metrics.")',
-              'status_col.info("Historical data is loaded once and retained in the shared app cache. Month and year changes reuse the cached dataset without downloading the Google Sheets again.")',
-              1,
-          )
-          page_path.write_text(page, encoding='utf-8')
+          new = '''    missing = result["crm_outcome"].isna() & result["phone_2"].ne("")
+    if missing.any():
+        missing_positions = result.index[missing]
+        secondary_source = result.loc[missing_positions, ["month", "phone_2"]].copy()
+        secondary = secondary_source.merge(
+            crm_one[["month", "match_phone", "crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]],
+            left_on=["month", "phone_2"], right_on=["month", "match_phone"], how="left", sort=False,
+        )
+        secondary.index = missing_positions
+        for column in ["crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]:
+            result.loc[missing_positions, column] = secondary[column]'''
 
-          app_path = Path('app.py')
-          app = app_path.read_text(encoding='utf-8')
-          old_app = '''if "historical_business_data" not in st.session_state:
-        try:
-            with st.spinner("Loading historical leads and Sales CRM sources…"):
-                st.session_state["historical_business_data"] = load_historical_business()
-        except Exception as exc:
-            st.error(f"Could not load historical business sources: {exc}")
-            st.stop()
+          if old not in text:
+              raise SystemExit('Expected CRM matching block not found')
 
-    historical_leads, historical_crm = st.session_state["historical_business_data"]'''
-          new_app = '''try:
-        with st.spinner("Loading historical data once and keeping it available in memory…"):
-            historical_leads, historical_crm = load_historical_business()
-    except Exception as exc:
-        st.error(f"Could not load historical business sources: {exc}")
-        st.stop()'''
-          if old_app in app:
-              app = app.replace(old_app, new_app, 1)
-          app_path.write_text(app, encoding='utf-8')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
           PY
 
-      - name: Validate Python syntax
-        run: python -m py_compile app.py historical_business.py pages/01_Historical_Business.py
+      - name: Validate syntax
+        run: python -m py_compile historical_business.py app.py pages/01_Historical_Business.py
 
-      - name: Commit cache update
+      - name: Run CRM matching regression test
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from historical_business import match_crm
+
+          leads = pd.DataFrame({
+              'month': ['2025-12', '2025-12'],
+              'phone': ['111', '222'],
+              'phone_2': ['999', ''],
+          })
+          crm = pd.DataFrame({
+              'month': ['2025-12'],
+              'phone': ['999'],
+              'phone_2': [''],
+              'crm_outcome': ['SALE CLOSED'],
+              'crm_status_raw': ['Delivered'],
+              'crm_value': [100.0],
+              'reason': [''],
+              'source_row_crm': [2],
+          })
+          out = match_crm(leads, crm)
+          assert out.loc[0, 'crm_outcome'] == 'SALE CLOSED'
+          assert out.loc[1, 'crm_outcome'] == 'NOT FOUND IN CRM'
+          print('CRM matching regression test passed')
+          PY
+
+      - name: Commit fix
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add historical_business.py pages/01_Historical_Business.py app.py
+          git add historical_business.py
           if git diff --cached --quiet; then
-            echo "No cache changes to commit"
+            echo "No changes to commit"
           else
-            git commit -m "Keep historical dashboard data loaded in shared cache"
+            git commit -m "Fix historical CRM secondary phone matching"
             git push
           fi
