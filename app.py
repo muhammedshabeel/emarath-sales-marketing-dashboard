@@ -22,6 +22,7 @@ from historical import (
     read_monthly_lead_count,
 )
 from meta_spend import META_AD_ACCOUNTS, fetch_meta_spend, monthly_spend_summary
+from historical_business import load_historical_business, render_historical_business
 
 st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="wide")
 
@@ -55,7 +56,7 @@ if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_inputs", None)
     st.session_state["analysis_schema_version"] = ANALYSIS_SCHEMA_VERSION
 
-HISTORICAL_SCHEMA_VERSION = 2
+HISTORICAL_SCHEMA_VERSION = 6
 if st.session_state.get("historical_schema_version") != HISTORICAL_SCHEMA_VERSION:
     st.session_state.pop("historical_analysis", None)
     st.session_state["historical_schema_version"] = HISTORICAL_SCHEMA_VERSION
@@ -586,47 +587,97 @@ def render_historical_dashboard(raw, historical):
 
 analysis_mode = st.sidebar.radio(
     "Analysis mode", ["Current operations", "Historical business analysis"],
-    help="Historical mode reads the January 2025 onward CRM workbook. Current operations uses DoubleTick and 3CX uploads.",
+    help="Historical mode uses the 2024–2026 monthly leads sheets, Sales CRM sheets and live Meta spend.",
 )
 
 if analysis_mode == "Historical business analysis":
-    st.sidebar.subheader("Historical source")
-    historical_url = st.sidebar.text_input(
-        "Google Sheet URL",
-        value=f"https://docs.google.com/spreadsheets/d/{HISTORICAL_SHEET_ID}/edit",
+    st.markdown("### Historical reporting period")
+
+    year_cols = st.columns(3)
+    year_values = [2024, 2025, 2026]
+    current_year = st.session_state.get("historical_year", 2025)
+    for idx, year_value in enumerate(year_values):
+        if year_cols[idx].button(
+            str(year_value),
+            type="primary" if current_year == year_value else "secondary",
+            use_container_width=True,
+            key=f"year_button_{year_value}",
+        ):
+            st.session_state["historical_year"] = year_value
+            if year_value == 2026 and st.session_state.get("historical_month", 4) > 4:
+                st.session_state["historical_month"] = 4
+            st.rerun()
+
+    selected_year = st.session_state.get("historical_year", 2025)
+    max_month = 4 if selected_year == 2026 else 12
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][:max_month]
+    current_month = min(st.session_state.get("historical_month", max_month), max_month)
+
+    for row_start in range(0, len(month_names), 6):
+        month_row = month_names[row_start:row_start + 6]
+        cols = st.columns(len(month_row))
+        for col_index, month_name in enumerate(month_row):
+            value = row_start + col_index + 1
+            if cols[col_index].button(
+                month_name,
+                type="primary" if current_month == value else "secondary",
+                use_container_width=True,
+                key=f"month_button_{selected_year}_{value}",
+            ):
+                st.session_state["historical_month"] = value
+                st.rerun()
+
+    month_number = min(st.session_state.get("historical_month", max_month), max_month)
+    selected_historical_month = f"{selected_year}-{month_number:02d}"
+    st.caption(
+        f"Selected: {pd.Period(selected_historical_month).strftime('%B %Y')} · "
+        "Sources: monthly leads sheet, monthly Sales CRM and live Meta spend."
     )
-    uploaded_history = st.sidebar.file_uploader(
-        "Or upload Excel", type=["xlsx", "xls"], key="historical_upload",
-        help="The uploaded workbook takes precedence over the Google Sheet URL.",
-    )
-    if st.sidebar.button("Refresh historical data", use_container_width=True):
-        load_historical_source.clear()
-        st.session_state.pop("historical_analysis", None)
-    load_requested = st.sidebar.button(
-        "Load historical dashboard", type="primary", use_container_width=True
-    )
-    if load_requested:
+
+    refresh_col, status_col = st.columns([1, 3])
+    refresh_history = refresh_col.button("Refresh sources", use_container_width=True)
+    status_col.info("2024 and 2025 include all months. 2026 currently includes January–April.")
+
+    if refresh_history:
+        load_historical_business.clear()
+        st.session_state.pop("historical_business_data", None)
+
+    if "historical_business_data" not in st.session_state:
         try:
-            with st.spinner("Loading and normalizing the historical workbook…"):
-                if uploaded_history is not None:
-                    raw_history = read_historical_workbook(uploaded_history)
-                    historical_data = normalize_historical_rows(raw_history)
-                else:
-                    raw_history, historical_data = load_historical_source(historical_url)
-                st.session_state["historical_analysis"] = (raw_history, historical_data)
+            with st.spinner("Loading historical leads and Sales CRM sources…"):
+                st.session_state["historical_business_data"] = load_historical_business()
         except Exception as exc:
-            st.error(f"Could not load the historical workbook: {exc}")
+            st.error(f"Could not load historical business sources: {exc}")
             st.stop()
-    if "historical_analysis" not in st.session_state:
-        st.info(
-            "Historical data is loaded only when requested so the app starts quickly. "
-            "Choose the Google Sheet or upload an Excel file, then click Load historical dashboard."
+
+    historical_leads, historical_crm = st.session_state["historical_business_data"]
+    available = set(historical_leads["month"].dropna().astype(str))
+    if selected_historical_month not in available:
+        st.warning(
+            f"No normalized lead rows were loaded for {pd.Period(selected_historical_month).strftime('%B %Y')}. "
+            "Click Refresh sources after checking the monthly tab."
         )
         st.stop()
-    raw_history, historical_data = st.session_state["historical_analysis"]
-    render_historical_dashboard(raw_history, historical_data)
-    st.stop()
 
+    period = pd.Period(selected_historical_month, freq="M")
+    meta_token = secret("META_ACCESS_TOKEN")
+    with st.spinner("Fetching matching Meta spend…"):
+        historical_meta_spend, historical_meta_errors = cached_meta_spend(
+            meta_token,
+            period.start_time.date(),
+            period.end_time.date(),
+            configured_meta_accounts(),
+        )
+
+    render_historical_business(
+        historical_leads,
+        historical_crm,
+        historical_meta_spend,
+        selected_historical_month,
+    )
+    if historical_meta_errors:
+        st.warning("Meta spend could not be read from every account: " + " | ".join(historical_meta_errors))
+    st.stop()
 
 with st.sidebar:
     st.header("Report controls")
