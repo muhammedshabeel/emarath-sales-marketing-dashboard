@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
 import re
 from dataclasses import dataclass
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2 import service_account
 
 
 HISTORICAL_LEADS = {
@@ -114,8 +118,47 @@ def normalize_crm_status(value) -> str:
     return "OTHER / UNMAPPED"
 
 
+def _google_service_account_info() -> dict | None:
+    try:
+        section = st.secrets.get("gcp_service_account")
+        if section:
+            return dict(section)
+    except Exception:
+        pass
+    try:
+        raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if raw:
+            return json.loads(str(raw))
+    except Exception:
+        pass
+    return None
+
+
+def _read_google_workbook(sheet_id: str) -> dict[str, pd.DataFrame]:
+    url = export_url(sheet_id)
+    info = _google_service_account_info()
+    if info:
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
+        response = AuthorizedSession(credentials).get(url, timeout=180)
+        response.raise_for_status()
+        return pd.read_excel(io.BytesIO(response.content), sheet_name=None, dtype=object)
+    try:
+        return pd.read_excel(url, sheet_name=None, dtype=object)
+    except Exception as exc:
+        if "401" in str(exc) or "Unauthorized" in str(exc):
+            raise RuntimeError(
+                "Google Sheets returned 401 Unauthorized. Either set each source sheet to "
+                "Anyone with the link - Viewer, or add a gcp_service_account section in "
+                "Streamlit Secrets and share all source sheets with that service-account email."
+            ) from exc
+        raise
+
+
 def _read_monthly_workbook(sheet_id: str, year: int, through_month: int = 12) -> dict[str, pd.DataFrame]:
-    sheets = pd.read_excel(export_url(sheet_id), sheet_name=None, dtype=object)
+    sheets = _read_google_workbook(sheet_id)
     selected = {}
     for name, frame in sheets.items():
         month = month_number(name)
