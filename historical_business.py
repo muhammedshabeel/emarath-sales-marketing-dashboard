@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
-from dataclasses import dataclass
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -24,12 +24,33 @@ HISTORICAL_CRM = {
 }
 
 MONTH_NAMES = {
-    "JAN": 1, "JANUARY": 1, "FEB": 2, "FEBRUARY": 2, "MARCH": 3,
-    "APR": 4, "APRIL": 4, "MAY": 5, "JUNE": 6, "JULY": 7,
-    "AUG": 8, "AUGUST": 8, "SEP": 9, "SEPTEMBER": 9,
-    "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11,
-    "DEC": 12, "DECEMBER": 12,
+    "JAN": 1,
+    "JANUARY": 1,
+    "FEB": 2,
+    "FEBRUARY": 2,
+    "MAR": 3,
+    "MARCH": 3,
+    "APR": 4,
+    "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUNE": 6,
+    "JUL": 7,
+    "JULY": 7,
+    "AUG": 8,
+    "AUGUST": 8,
+    "SEP": 9,
+    "SEPTEMBER": 9,
+    "OCT": 10,
+    "OCTOBER": 10,
+    "NOV": 11,
+    "NOVEMBER": 11,
+    "DEC": 12,
+    "DECEMBER": 12,
 }
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+JOINED_SNAPSHOT = DATA_DIR / "historical_joined.pkl.gz"
 
 
 def export_url(sheet_id: str) -> str:
@@ -45,10 +66,8 @@ def clean(series: pd.Series) -> pd.Series:
 
 
 def amount(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(
-        clean(series).str.replace(",", "", regex=False).str.extract(r"(-?\d+(?:\.\d+)?)", expand=False),
-        errors="coerce",
-    ).fillna(0.0)
+    extracted = clean(series).str.replace(",", "", regex=False).str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
+    return pd.to_numeric(extracted, errors="coerce").fillna(0.0)
 
 
 def phone(series: pd.Series) -> pd.Series:
@@ -58,8 +77,9 @@ def phone(series: pd.Series) -> pd.Series:
 def find_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
     lookup = {canon(column): column for column in frame.columns}
     for name in names:
-        if canon(name) in lookup:
-            return lookup[canon(name)]
+        key = canon(name)
+        if key in lookup:
+            return lookup[key]
     for key, column in lookup.items():
         if any(canon(name) in key or key in canon(name) for name in names):
             return column
@@ -93,7 +113,7 @@ def normalize_customer_path(value) -> str:
         return "LEAD & RE-ORDER"
     if "REORDER" in value:
         return "RE-ORDER"
-    if "NEWENQUIRY" in value or "NEWENQUIRY" in value:
+    if "NEWENQUIRY" in value or "NEWINQUIRY" in value:
         return "NEW ENQUIRY"
     if value in {"LEAD", "SALESCLOSED", "SALECLOSED"}:
         return "LEAD"
@@ -145,22 +165,12 @@ def _read_google_workbook(sheet_id: str) -> dict[str, pd.DataFrame]:
         response = AuthorizedSession(credentials).get(url, timeout=180)
         response.raise_for_status()
         return pd.read_excel(io.BytesIO(response.content), sheet_name=None, dtype=object)
-    try:
-        return pd.read_excel(url, sheet_name=None, dtype=object)
-    except Exception as exc:
-        if "401" in str(exc) or "Unauthorized" in str(exc):
-            raise RuntimeError(
-                "Google Sheets returned 401 Unauthorized. Either set each source sheet to "
-                "Anyone with the link - Viewer, or add a gcp_service_account section in "
-                "Streamlit Secrets and share all source sheets with that service-account email."
-            ) from exc
-        raise
+    return pd.read_excel(url, sheet_name=None, dtype=object)
 
 
 def _read_monthly_workbook(sheet_id: str, year: int, through_month: int = 12) -> dict[str, pd.DataFrame]:
-    sheets = _read_google_workbook(sheet_id)
-    selected = {}
-    for name, frame in sheets.items():
+    selected: dict[str, pd.DataFrame] = {}
+    for name, frame in _read_google_workbook(sheet_id).items():
         month = month_number(name)
         if month is None or month > through_month:
             continue
@@ -191,87 +201,177 @@ def normalize_lead_sheet(frame: pd.DataFrame, month: str) -> pd.DataFrame:
 def normalize_crm_sheet(frame: pd.DataFrame, month: str) -> pd.DataFrame:
     data = pd.DataFrame(index=frame.index)
     data["month"] = month
-    data["date"] = pd.to_datetime(col(frame, ("DATE",)), errors="coerce", dayfirst=True, format="mixed")
-    data["agent"] = clean(col(frame, ("AGENT",))).str.upper().replace("", "UNASSIGNED")
+    data["date_crm"] = pd.to_datetime(col(frame, ("DATE",)), errors="coerce", dayfirst=True, format="mixed")
+    data["agent_crm"] = clean(col(frame, ("AGENT",))).str.upper().replace("", "UNASSIGNED")
     data["phone"] = phone(col(frame, ("NUMBER", "NUMBER1", "PHONE")))
     data["phone_2"] = phone(col(frame, ("NUMBER2", "PHONE 2")))
     data["em_number"] = clean(col(frame, ("EM NUMBER", "EMNUMBER"))).str.upper()
     data["tracking_number"] = clean(col(frame, ("TRACKING NUM", "TRACKING NUMBER"))).str.upper()
-    data["product"] = clean(col(frame, ("PRODUCT 1", "PRODUCT")))
+    data["product_crm"] = clean(col(frame, ("PRODUCT 1", "PRODUCT")))
     data["crm_value"] = amount(col(frame, ("VALUE", "TOTAL")))
     data["customer_path_crm"] = clean(col(frame, ("CUSTOMER PATH", "CUSTOMERPATH"))).map(normalize_customer_path)
     data["crm_status_raw"] = clean(col(frame, ("CS STATUS", "STATUS")))
     data["crm_outcome"] = data["crm_status_raw"].map(normalize_crm_status)
     data["reason"] = clean(col(frame, ("REASON", "NOTES", "REMARKS")))
     data["source_row_crm"] = frame.index + 2
-    return data[data["phone"].ne("") | data["phone_2"].ne("") | data["em_number"].ne("")].reset_index(drop=True)
+    keep = data["phone"].ne("") | data["phone_2"].ne("") | data["em_number"].ne("")
+    return data[keep].reset_index(drop=True)
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_historical_business() -> tuple[pd.DataFrame, pd.DataFrame]:
-    lead_parts = []
-    crm_parts = []
+def _build_normalized_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
+    lead_parts: list[pd.DataFrame] = []
+    crm_parts: list[pd.DataFrame] = []
+
     for year, sheet_id in HISTORICAL_LEADS.items():
         through = 4 if year == 2026 else 12
         for month, frame in _read_monthly_workbook(sheet_id, year, through).items():
             lead_parts.append(normalize_lead_sheet(frame, month))
+
     for year, sheet_id in HISTORICAL_CRM.items():
         for month, frame in _read_monthly_workbook(sheet_id, year).items():
             crm_parts.append(normalize_crm_sheet(frame, month))
+
     leads = pd.concat(lead_parts, ignore_index=True) if lead_parts else pd.DataFrame()
     crm = pd.concat(crm_parts, ignore_index=True) if crm_parts else pd.DataFrame()
     return leads, crm
 
 
-def match_crm(leads: pd.DataFrame, crm: pd.DataFrame) -> pd.DataFrame:
-    crm_long = pd.concat([
-        crm.assign(match_phone=crm["phone"]),
-        crm[crm["phone_2"].ne("")].assign(match_phone=crm.loc[crm["phone_2"].ne(""), "phone_2"]),
-    ], ignore_index=True)
-    priority = {"SALE CLOSED": 1, "CANCELLED / RETURN": 2, "PENDING / IN PROCESS": 3, "OTHER / UNMAPPED": 4}
+def preprocess_historical_dataset(leads: pd.DataFrame, crm: pd.DataFrame) -> pd.DataFrame:
+    if leads.empty:
+        return leads.copy()
+
+    crm_primary = crm.copy()
+    crm_primary["match_phone"] = crm_primary["phone"]
+    crm_secondary = crm[crm["phone_2"].ne("")].copy()
+    crm_secondary["match_phone"] = crm_secondary["phone_2"]
+    crm_long = pd.concat([crm_primary, crm_secondary], ignore_index=True)
+
+    priority = {
+        "SALE CLOSED": 1,
+        "CANCELLED / RETURN": 2,
+        "PENDING / IN PROCESS": 3,
+        "OTHER / UNMAPPED": 4,
+    }
     crm_long["priority"] = crm_long["crm_outcome"].map(priority).fillna(9)
-    crm_one = crm_long.sort_values(["month", "match_phone", "priority", "source_row_crm"]).drop_duplicates(
-        ["month", "match_phone"], keep="first"
+    crm_one = crm_long.sort_values(
+        ["month", "match_phone", "priority", "source_row_crm"],
+        kind="stable",
+    ).drop_duplicates(["month", "match_phone"], keep="first")
+
+    crm_columns = [
+        "month",
+        "match_phone",
+        "crm_outcome",
+        "crm_status_raw",
+        "crm_value",
+        "reason",
+        "source_row_crm",
+        "tracking_number",
+        "em_number",
+    ]
+
+    joined = leads.reset_index(drop=True).merge(
+        crm_one[crm_columns],
+        left_on=["month", "phone"],
+        right_on=["month", "match_phone"],
+        how="left",
+        sort=False,
     )
-    result = leads.merge(
-        crm_one[["month", "match_phone", "crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]],
-        left_on=["month", "phone"], right_on=["month", "match_phone"], how="left",
-    )
-    missing = result["crm_outcome"].isna() & result["phone_2"].ne("")
-    if missing.any():
-        secondary = leads.loc[missing].merge(
-            crm_one[["month", "match_phone", "crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]],
-            left_on=["month", "phone_2"], right_on=["month", "match_phone"], how="left",
+
+    missing_mask = joined["crm_outcome"].isna() & joined["phone_2"].ne("")
+    if missing_mask.any():
+        secondary_keys = joined.loc[missing_mask, ["month", "phone_2"]].copy()
+        secondary_keys["_row_id"] = secondary_keys.index
+        secondary_matches = secondary_keys.merge(
+            crm_one[crm_columns],
+            left_on=["month", "phone_2"],
+            right_on=["month", "match_phone"],
+            how="left",
+            sort=False,
+        ).set_index("_row_id")
+        for column in [
+            "crm_outcome",
+            "crm_status_raw",
+            "crm_value",
+            "reason",
+            "source_row_crm",
+            "tracking_number",
+            "em_number",
+        ]:
+            joined.loc[secondary_matches.index, column] = secondary_matches[column]
+
+    joined["crm_outcome"] = joined["crm_outcome"].fillna("NOT FOUND IN CRM")
+    joined["crm_status_raw"] = joined["crm_status_raw"].fillna("")
+    joined["reason"] = joined["reason"].fillna("")
+    joined["crm_value"] = pd.to_numeric(joined["crm_value"], errors="coerce").fillna(0.0)
+    joined["final_revenue"] = joined["crm_value"].where(joined["crm_value"].gt(0), joined["order_value"])
+    joined["is_closed"] = joined["crm_outcome"].eq("SALE CLOSED")
+    joined["is_cancelled"] = joined["crm_outcome"].eq("CANCELLED / RETURN")
+    joined["is_pending"] = joined["crm_outcome"].eq("PENDING / IN PROCESS")
+    return joined
+
+
+@st.cache_resource(show_spinner=False)
+def load_historical_dataset() -> pd.DataFrame:
+    if JOINED_SNAPSHOT.exists():
+        return pd.read_pickle(JOINED_SNAPSHOT, compression="gzip")
+    leads, crm = _build_normalized_sources()
+    return preprocess_historical_dataset(leads, crm)
+
+
+@st.cache_resource(show_spinner=False)
+def load_historical_business() -> tuple[pd.DataFrame, pd.DataFrame]:
+    dataset = load_historical_dataset()
+    return dataset, pd.DataFrame()
+
+
+def render_historical_business(
+    leads: pd.DataFrame,
+    crm: pd.DataFrame,
+    meta_spend: pd.DataFrame,
+    selected_month: str,
+) -> None:
+    if "crm_outcome" in leads.columns:
+        joined = leads[leads["month"].eq(selected_month)].copy()
+    else:
+        joined = preprocess_historical_dataset(
+            leads[leads["month"].eq(selected_month)].copy(),
+            crm[crm["month"].eq(selected_month)].copy(),
         )
-        for column in ["crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]:
-            result.loc[missing, column] = secondary[column].to_numpy()
-    result["crm_outcome"] = result["crm_outcome"].fillna("NOT FOUND IN CRM")
-    result["crm_value"] = pd.to_numeric(result["crm_value"], errors="coerce").fillna(0.0)
-    return result
 
-
-def render_historical_business(leads: pd.DataFrame, crm: pd.DataFrame, meta_spend: pd.DataFrame, selected_month: str) -> None:
-    joined = match_crm(leads[leads["month"].eq(selected_month)].copy(), crm[crm["month"].eq(selected_month)].copy())
     if joined.empty:
         st.warning("No historical lead rows were found for this month.")
         return
 
     new_leads = joined[joined["customer_path"].eq("LEAD")]
     orders = joined[joined["is_order"]]
-    closed = joined[joined["crm_outcome"].eq("SALE CLOSED")]
-    cancelled = joined[joined["crm_outcome"].eq("CANCELLED / RETURN")]
-    pending = joined[joined["crm_outcome"].eq("PENDING / IN PROCESS")]
-    total_spend = float(meta_spend["spend"].sum()) if not meta_spend.empty else 0.0
+    closed = joined[joined["is_closed"]]
+    cancelled = joined[joined["is_cancelled"]]
+    pending = joined[joined["is_pending"]]
+
+    total_spend = float(meta_spend["spend"].sum()) if not meta_spend.empty and "spend" in meta_spend.columns else 0.0
     order_value = float(orders["order_value"].sum())
-    closed_revenue = float(closed["crm_value"].where(closed["crm_value"].gt(0), closed["order_value"]).sum())
+    closed_revenue = float(closed["final_revenue"].sum())
     cpl = total_spend / len(new_leads) if len(new_leads) else 0.0
     order_rate = len(orders) / len(new_leads) * 100 if len(new_leads) else 0.0
     close_rate = len(closed) / len(orders) * 100 if len(orders) else 0.0
     cancel_rate = len(cancelled) / len(orders) * 100 if len(orders) else 0.0
     roas = closed_revenue / total_spend if total_spend else 0.0
 
-    st.markdown(f'<div class="hero"><h2>Historical business command centre</h2><p>{pd.Period(selected_month).strftime("%B %Y")} · Leads sheet → agent orders → Sales CRM final outcome → Meta spend</p></div>', unsafe_allow_html=True)
-    tabs = st.tabs(["Executive overview", "Customer paths", "Sales CRM outcomes", "Agents", "Marketing", "Insights & data"])
+    st.markdown(
+        f'<div class="hero"><h2>Historical business command centre</h2><p>'
+        f'{pd.Period(selected_month).strftime("%B %Y")} · Preprocessed leads + Sales CRM outcomes + Meta spend</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    tabs = st.tabs([
+        "Executive overview",
+        "Customer paths",
+        "Sales CRM outcomes",
+        "Agents",
+        "Marketing",
+        "Insights & data",
+    ])
 
     with tabs[0]:
         row1 = st.columns(5)
@@ -280,6 +380,7 @@ def render_historical_business(leads: pd.DataFrame, crm: pd.DataFrame, meta_spen
         row1[2].metric("CPL", f"AED {cpl:,.2f}" if len(new_leads) else "N/A")
         row1[3].metric("Agent-created orders", f"{len(orders):,}", f"{order_rate:.1f}% of leads")
         row1[4].metric("Initial order value", f"AED {order_value:,.2f}")
+
         row2 = st.columns(5)
         row2[0].metric("Final sales closed", f"{len(closed):,}", f"{close_rate:.1f}% of orders")
         row2[1].metric("Final closed revenue", f"AED {closed_revenue:,.2f}")
@@ -295,33 +396,42 @@ def render_historical_business(leads: pd.DataFrame, crm: pd.DataFrame, meta_spen
 
     with tabs[1]:
         path = joined.groupby("customer_path", as_index=False).agg(
-            records=("source_row", "size"), orders=("is_order", "sum"),
+            records=("source_row", "size"),
+            orders=("is_order", "sum"),
             initial_value=("order_value", "sum"),
-            closed_sales=("crm_outcome", lambda values: values.eq("SALE CLOSED").sum()),
-            cancelled=("crm_outcome", lambda values: values.eq("CANCELLED / RETURN").sum()),
+            closed_sales=("is_closed", "sum"),
+            cancelled=("is_cancelled", "sum"),
         )
         path["order_conversion_pct"] = path["orders"].div(path["records"].replace(0, pd.NA)).mul(100)
         path["final_close_pct"] = path["closed_sales"].div(path["orders"].replace(0, pd.NA)).mul(100)
         st.dataframe(path.sort_values("records", ascending=False), hide_index=True, use_container_width=True)
-        st.plotly_chart(px.bar(path, x="customer_path", y=["records", "orders", "closed_sales"], barmode="group", title="Customer-path performance"), use_container_width=True)
-        st.caption("Missed Lead, Broadcast, Re-Order and Lead & Re-Order are highlighted separately. Only LEAD is used as the Meta CPL denominator.")
+        st.plotly_chart(
+            px.bar(path, x="customer_path", y=["records", "orders", "closed_sales"], barmode="group", title="Customer-path performance"),
+            use_container_width=True,
+        )
+        st.caption("Only LEAD is used as the Meta CPL denominator. Other customer paths remain separate business metrics.")
 
     with tabs[2]:
         outcomes = joined.groupby("crm_outcome", as_index=False).agg(
-            orders=("source_row", "size"), amount=("crm_value", "sum")
+            records=("source_row", "size"),
+            amount=("final_revenue", "sum"),
         )
-        outcomes["share_pct"] = outcomes["orders"].div(len(orders) if len(orders) else len(joined)).mul(100)
-        st.dataframe(outcomes.sort_values("orders", ascending=False), hide_index=True, use_container_width=True)
-        reasons = joined[joined["crm_outcome"].eq("CANCELLED / RETURN")].groupby("reason", as_index=False).size().sort_values("size", ascending=False)
+        outcomes["share_pct"] = outcomes["records"].div(len(joined)).mul(100)
+        st.dataframe(outcomes.sort_values("records", ascending=False), hide_index=True, use_container_width=True)
+
+        reasons = cancelled.groupby("reason", as_index=False).size().sort_values("size", ascending=False)
         st.markdown("#### Cancellation and rejection reasons")
         st.dataframe(reasons, hide_index=True, use_container_width=True)
 
     with tabs[3]:
         agent = joined.groupby("agent", as_index=False).agg(
-            handled=("source_row", "size"), new_leads=("customer_path", lambda values: values.eq("LEAD").sum()),
-            orders=("is_order", "sum"), initial_value=("order_value", "sum"),
-            closed_sales=("crm_outcome", lambda values: values.eq("SALE CLOSED").sum()),
-            cancelled=("crm_outcome", lambda values: values.eq("CANCELLED / RETURN").sum()),
+            handled=("source_row", "size"),
+            new_leads=("customer_path", lambda values: values.eq("LEAD").sum()),
+            orders=("is_order", "sum"),
+            initial_value=("order_value", "sum"),
+            closed_sales=("is_closed", "sum"),
+            closed_revenue=("final_revenue", lambda values: values[joined.loc[values.index, "is_closed"]].sum()),
+            cancelled=("is_cancelled", "sum"),
         )
         agent["lead_to_order_pct"] = agent["orders"].div(agent["new_leads"].replace(0, pd.NA)).mul(100)
         agent["order_to_close_pct"] = agent["closed_sales"].div(agent["orders"].replace(0, pd.NA)).mul(100)
@@ -333,14 +443,12 @@ def render_historical_business(leads: pd.DataFrame, crm: pd.DataFrame, meta_spen
             {"Metric": "New leads", "Value": len(new_leads)},
             {"Metric": "CPL", "Value": cpl},
             {"Metric": "Agent-created orders", "Value": len(orders)},
-            {"Metric": "Cost per agent order", "Value": total_spend / len(orders) if len(orders) else 0},
             {"Metric": "Final closed sales", "Value": len(closed)},
-            {"Metric": "Cost per final sale", "Value": total_spend / len(closed) if len(closed) else 0},
             {"Metric": "Final closed revenue", "Value": closed_revenue},
             {"Metric": "Final ROAS", "Value": roas},
         ])
         st.dataframe(metrics, hide_index=True, use_container_width=True)
-        if not meta_spend.empty:
+        if not meta_spend.empty and {"date", "spend"}.issubset(meta_spend.columns):
             daily = meta_spend.groupby("date", as_index=False)["spend"].sum()
             st.plotly_chart(px.line(daily, x="date", y="spend", markers=True, title="Daily Meta spend"), use_container_width=True)
 
