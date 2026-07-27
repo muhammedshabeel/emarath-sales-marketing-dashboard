@@ -1,0 +1,116 @@
+name: Add authenticated Google Sheet loading
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/add-google-sheet-auth.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch historical loader
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('historical_business.py')
+          text = path.read_text(encoding='utf-8')
+
+          text = text.replace(
+              'import re\nfrom dataclasses import dataclass\n',
+              'import io\nimport json\nimport re\nfrom dataclasses import dataclass\n',
+              1,
+          )
+          text = text.replace(
+              'import streamlit as st\n',
+              'import streamlit as st\nfrom google.auth.transport.requests import AuthorizedSession\nfrom google.oauth2 import service_account\n',
+              1,
+          )
+
+          old = '''def _read_monthly_workbook(sheet_id: str, year: int, through_month: int = 12) -> dict[str, pd.DataFrame]:
+              sheets = pd.read_excel(export_url(sheet_id), sheet_name=None, dtype=object)
+              selected = {}
+              for name, frame in sheets.items():
+                  month = month_number(name)
+                  if month is None or month > through_month:
+                      continue
+                  selected[f"{year}-{month:02d}"] = frame
+              return selected'''
+
+          new = '''def _google_service_account_info() -> dict | None:
+              try:
+                  section = st.secrets.get("gcp_service_account")
+                  if section:
+                      return dict(section)
+              except Exception:
+                  pass
+              try:
+                  raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+                  if raw:
+                      return json.loads(str(raw))
+              except Exception:
+                  pass
+              return None
+
+
+          def _read_google_workbook(sheet_id: str) -> dict[str, pd.DataFrame]:
+              url = export_url(sheet_id)
+              info = _google_service_account_info()
+              if info:
+                  credentials = service_account.Credentials.from_service_account_info(
+                      info,
+                      scopes=["https://www.googleapis.com/auth/drive.readonly"],
+                  )
+                  response = AuthorizedSession(credentials).get(url, timeout=180)
+                  response.raise_for_status()
+                  return pd.read_excel(io.BytesIO(response.content), sheet_name=None, dtype=object)
+              try:
+                  return pd.read_excel(url, sheet_name=None, dtype=object)
+              except Exception as exc:
+                  if "401" in str(exc) or "Unauthorized" in str(exc):
+                      raise RuntimeError(
+                          "Google Sheets returned 401 Unauthorized. Either set each source sheet to "
+                          "Anyone with the link - Viewer, or add a gcp_service_account section in "
+                          "Streamlit Secrets and share all source sheets with that service-account email."
+                      ) from exc
+                  raise
+
+
+          def _read_monthly_workbook(sheet_id: str, year: int, through_month: int = 12) -> dict[str, pd.DataFrame]:
+              sheets = _read_google_workbook(sheet_id)
+              selected = {}
+              for name, frame in sheets.items():
+                  month = month_number(name)
+                  if month is None or month > through_month:
+                      continue
+                  selected[f"{year}-{month:02d}"] = frame
+              return selected'''
+
+          if old not in text:
+              raise SystemExit('Historical workbook loader block not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          req = Path('requirements.txt')
+          requirements = req.read_text(encoding='utf-8')
+          if 'google-auth' not in requirements:
+              requirements += '\ngoogle-auth>=2.35,<3\n'
+          req.write_text(requirements, encoding='utf-8')
+          PY
+      - name: Validate
+        run: python -m py_compile historical_business.py app.py
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add historical_business.py requirements.txt
+          git commit -m "Support authenticated private Google Sheets" || exit 0
+          git push
