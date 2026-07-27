@@ -1,4 +1,4 @@
-name: Build historical dataset snapshots
+name: Apply historical CRM hotfix
 
 on:
   workflow_dispatch:
@@ -10,133 +10,60 @@ permissions:
   contents: write
 
 jobs:
-  build-snapshots:
+  hotfix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install openpyxl
-
-      - name: Patch historical loader and create snapshot builder
+      - name: Replace unsafe secondary phone matching
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
-          history_path = Path('historical_business.py')
-          text = history_path.read_text(encoding='utf-8')
+          path = Path('historical_business.py')
+          text = path.read_text(encoding='utf-8')
 
-          if 'from pathlib import Path' not in text:
-              text = text.replace('import re\n', 'import re\nfrom pathlib import Path\n', 1)
-
-          marker = '@st.cache_resource(show_spinner=False)\ndef load_historical_business() -> tuple[pd.DataFrame, pd.DataFrame]:\n'
-          if marker not in text:
-              raise SystemExit('Historical loader marker not found')
-
-          start = text.index(marker)
-          body_start = start + len(marker)
-          next_def = text.index('\n\ndef match_crm', body_start)
-          old_body = text[body_start:next_def]
-
-          replacement = '''DATA_DIR = Path(__file__).resolve().parent / "data"
-          LEADS_SNAPSHOT = DATA_DIR / "historical_leads.pkl.gz"
-          CRM_SNAPSHOT = DATA_DIR / "historical_crm.pkl.gz"
-
-
-          def build_historical_business_from_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
-          ''' + old_body + '''
-
-
-          @st.cache_resource(show_spinner=False)
-          def load_historical_business() -> tuple[pd.DataFrame, pd.DataFrame]:
-              """Load immutable preprocessed snapshots; fetch Sheets only as a fallback."""
-              if LEADS_SNAPSHOT.exists() and CRM_SNAPSHOT.exists():
-                  leads = pd.read_pickle(LEADS_SNAPSHOT, compression="gzip")
-                  crm = pd.read_pickle(CRM_SNAPSHOT, compression="gzip")
-                  return leads, crm
-              return build_historical_business_from_sources()
-          '''
-
-          text = text[:start] + replacement + text[next_def:]
-          history_path.write_text(text, encoding='utf-8')
-
-          scripts = Path('scripts')
-          scripts.mkdir(exist_ok=True)
-          Path('data').mkdir(exist_ok=True)
-          Path('scripts/build_historical_snapshot.py').write_text('''from pathlib import Path
-          import sys
-
-          ROOT = Path(__file__).resolve().parents[1]
-          if str(ROOT) not in sys.path:
-              sys.path.insert(0, str(ROOT))
-
-          from historical_business import (  # noqa: E402
-              CRM_SNAPSHOT,
-              LEADS_SNAPSHOT,
-              build_historical_business_from_sources,
+          pattern = re.compile(
+              r'    missing = result\["crm_outcome"\]\.isna\(\) & result\["phone_2"\]\.ne\(""\)\n'
+              r'    if missing\.any\(\):\n'
+              r'        secondary = leads\.loc\[missing\]\.merge\(\n'
+              r'            crm_one\[\["month", "match_phone", "crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"\]\],\n'
+              r'            left_on=\["month", "phone_2"\], right_on=\["month", "match_phone"\], how="left",\n'
+              r'        \)\n'
+              r'        for column in \["crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"\]:\n'
+              r'            result\.loc\[missing, column\] = secondary\[column\]\.to_numpy\(\)'
           )
 
-          leads, crm = build_historical_business_from_sources()
-          LEADS_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-          leads.to_pickle(LEADS_SNAPSHOT, compression="gzip")
-          crm.to_pickle(CRM_SNAPSHOT, compression="gzip")
-          print(f"Saved {len(leads):,} lead rows to {LEADS_SNAPSHOT}")
-          print(f"Saved {len(crm):,} CRM rows to {CRM_SNAPSHOT}")
-          ''', encoding='utf-8')
+          replacement = '''    missing = result["crm_outcome"].isna() & result["phone_2"].ne("")
+    if missing.any():
+        missing_rows = result.loc[missing, ["month", "phone_2"]].copy()
+        secondary = missing_rows.merge(
+            crm_one[["month", "match_phone", "crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]],
+            left_on=["month", "phone_2"], right_on=["month", "match_phone"], how="left", sort=False,
+        )
+        secondary.index = missing_rows.index
+        for column in ["crm_outcome", "crm_status_raw", "crm_value", "reason", "source_row_crm"]:
+            result.loc[missing_rows.index, column] = secondary[column].reindex(missing_rows.index)'''
 
-          page_path = Path('pages/01_Historical_Business.py')
-          page = page_path.read_text(encoding='utf-8')
-          page = page.replace(
-              'with st.spinner("Loading historical data once and keeping it available in memory…"):',
-              'with st.spinner("Opening the preprocessed historical dataset…"):',
-          )
-          page = page.replace(
-              'Historical data is loaded once and retained in the shared app cache. Month and year changes reuse the cached dataset without downloading the Google Sheets again.',
-              'Historical data is served from a preprocessed local snapshot. Month and year changes do not download or parse Google Sheets.',
-          )
-          page_path.write_text(page, encoding='utf-8')
-
-          app_path = Path('app.py')
-          app = app_path.read_text(encoding='utf-8')
-          app = app.replace(
-              'with st.spinner("Loading historical data once and keeping it available in memory…"):',
-              'with st.spinner("Opening the preprocessed historical dataset…"):',
-          )
-          app_path.write_text(app, encoding='utf-8')
+          updated, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'Expected one unsafe CRM matching block, found {count}')
+          path.write_text(updated, encoding='utf-8')
           PY
 
-      - name: Build permanent snapshots
-        run: python scripts/build_historical_snapshot.py
-
-      - name: Validate snapshots and Python syntax
-        shell: bash
+      - name: Validate hotfix
         run: |
-          test -s data/historical_leads.pkl.gz
-          test -s data/historical_crm.pkl.gz
-          python -m py_compile historical_business.py app.py pages/01_Historical_Business.py scripts/build_historical_snapshot.py
-          python - <<'PY'
-          from historical_business import load_historical_business
-          leads, crm = load_historical_business()
-          assert not leads.empty, 'Leads snapshot is empty'
-          assert not crm.empty, 'CRM snapshot is empty'
-          assert 'month' in leads.columns
-          assert 'month' in crm.columns
-          print(f'Validated {len(leads):,} leads and {len(crm):,} CRM rows')
-          PY
+          python -m py_compile historical_business.py
+          grep -q 'missing_rows = result.loc' historical_business.py
+          ! grep -q 'secondary = leads.loc\[missing\]' historical_business.py
 
-      - name: Commit preprocessed datasets
+      - name: Commit hotfix
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add historical_business.py pages/01_Historical_Business.py app.py scripts/build_historical_snapshot.py data/historical_leads.pkl.gz data/historical_crm.pkl.gz
-          if git diff --cached --quiet; then
-            echo "No snapshot changes to commit"
-          else
-            git commit -m "Use permanent preprocessed historical datasets"
-            git push
-          fi
+          git add historical_business.py
+          git commit -m "Apply direct historical CRM matching hotfix"
+          git push
