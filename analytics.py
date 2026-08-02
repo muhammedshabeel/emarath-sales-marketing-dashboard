@@ -262,7 +262,7 @@ def build_analysis(leads, sales, calls, start, end, report_tz, streak_gap_minute
     joined.loc[joined.workpex_match_count.gt(1), "workpex_reconciliation"] = "MULTIPLE WORKPEX ORDERS"
     joined["called"] = joined.lead_region.eq("GCC") & joined.call_count.gt(0)
     joined["answered_any"] = joined.lead_region.eq("GCC") & joined.answered_calls.gt(0)
-    if joined.lead_time.notna().any():
+    if not calls.empty and joined.lead_time.notna().any():
         joined["speed_to_first_call_minutes"] = (joined.first_call_time - joined.lead_time).dt.total_seconds().div(60)
     else:
         joined["speed_to_first_call_minutes"] = float("nan")
@@ -287,21 +287,29 @@ def grouped(joined, field):
     return out.sort_values("leads", ascending=False)
 
 
-def qa_report(leads, sales, calls, source_ranges):
+def qa_report(leads, sales, calls, source_ranges, calls_available=True):
     rows = []
-    for source, df, key in (("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key"), ("3CX", calls, "call_key")):
+    sources = [("DoubleTick", leads, "phone_key"), ("Workpex", sales, "phone_key")]
+    if calls_available:
+        sources.append(("3CX", calls, "call_key"))
+    for source, df, key in sources:
         invalid = int(df[key].str.len().lt(8).sum()) if key in df else len(df)
         collisions = int(df[df[key].ne("")].groupby(key).size().gt(1).sum()) if key in df else 0
         rows.append({"check": f"{source}: invalid phone keys", "value": invalid, "severity": "High" if invalid else "OK"})
         rows.append({"check": f"{source}: repeated last-8 keys", "value": collisions, "severity": "Review" if collisions else "OK"})
-    rows.append({"check": "Source handling", "value": "DoubleTick upload + Workpex upload + 3CX upload + Meta API", "severity": "OK"})
+    source_handling = "DoubleTick upload + Workpex upload + Meta API"
+    source_handling += " + 3CX upload" if calls_available else " (3CX not uploaded — optional)"
+    rows.append({"check": "Source handling", "value": source_handling, "severity": "OK"})
     lead_keys = set(leads.phone_key); sales_keys = set(sales.phone_key)
     gcc_leads = leads[leads.lead_region.eq("GCC")] if "lead_region" in leads else leads
     lead_call_keys = set(gcc_leads.call_key)
     call_keys = set(calls.call_key)
     rows.append({"check": "DoubleTick leads without a Workpex conversion", "value": len(lead_keys - sales_keys), "severity": "Review" if lead_keys - sales_keys else "OK"})
-    rows.append({"check": "DoubleTick leads absent from outbound GCC 3CX (last 9 digits)", "value": len(lead_call_keys - call_keys), "severity": "Review" if lead_call_keys - call_keys else "OK"})
     rows.append({"check": "Workpex orders from other sources", "value": int((~sales.order_from_generated_lead).sum()) if "order_from_generated_lead" in sales else len(sales_keys - lead_keys), "severity": "Review"})
-    rows.append({"check": "GCC 3CX numbers unmatched to a lead", "value": len(call_keys - lead_call_keys), "severity": "Review"})
+    if calls_available:
+        rows.append({"check": "DoubleTick leads absent from outbound GCC 3CX (last 9 digits)", "value": len(lead_call_keys - call_keys), "severity": "Review" if lead_call_keys - call_keys else "OK"})
+        rows.append({"check": "GCC 3CX numbers unmatched to a lead", "value": len(call_keys - lead_call_keys), "severity": "Review"})
+    else:
+        rows.append({"check": "3CX call analysis", "value": "Not uploaded (optional)", "severity": "Info"})
     rows.append({"check": "Other-country DoubleTick leads shown separately", "value": int(leads.lead_region.eq("Other country").sum()) if "lead_region" in leads else 0, "severity": "Review"})
     return pd.DataFrame(rows)
