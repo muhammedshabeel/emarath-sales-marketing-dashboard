@@ -23,7 +23,13 @@ from historical import (
     read_monthly_lead_count,
 )
 from meta_spend import META_AD_ACCOUNTS, fetch_meta_spend, monthly_spend_summary
-from historical_business import load_historical_business, render_historical_business
+try:
+    from historical_business import load_historical_business, render_historical_business
+except ModuleNotFoundError:
+    # The historical package is optional in deployment. Never let its absence
+    # take down Current Operations during Streamlit startup.
+    load_historical_business = None
+    render_historical_business = None
 
 st.set_page_config(page_title="Emarath Intelligence", page_icon="📊", layout="wide")
 
@@ -594,6 +600,12 @@ analysis_mode = st.sidebar.radio(
 )
 
 if analysis_mode == "Historical business analysis":
+    if load_historical_business is None or render_historical_business is None:
+        st.error(
+            "Historical business analysis is temporarily unavailable because "
+            "its optional module is not installed. Current Operations remains available."
+        )
+        st.stop()
     st.markdown("### Historical reporting period")
 
     year_cols = st.columns(3)
