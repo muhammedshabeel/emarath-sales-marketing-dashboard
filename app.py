@@ -8,6 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from analytics import agent_directory_frame, attach_attribution, build_analysis, grouped, normalize_attribution, normalize_calls, normalize_leads, normalize_sales, qa_report
 from data_io import choose_best_sheet, detect_column, read_upload
+from delivery import delivery_kpis, delivery_summary, normalize_delivery
 from enrichment import classify_campaign, generate_fixed_zip_report
 from historical import (
     HISTORICAL_SHEET_ID,
@@ -50,7 +51,7 @@ st.markdown("""
 st.title("Sales & Marketing Intelligence")
 st.caption("DoubleTick leads × uploaded Workpex conversions × optional 3CX calls × live Meta spend")
 
-ANALYSIS_SCHEMA_VERSION = 28
+ANALYSIS_SCHEMA_VERSION = 29
 if st.session_state.get("analysis_schema_version") != ANALYSIS_SCHEMA_VERSION:
     st.session_state.pop("analysis_results", None)
     st.session_state.pop("analysis_inputs", None)
@@ -212,14 +213,16 @@ def mapping_ui(df, source):
         "Attribution": ["phone", "ad_id", "campaign", "status"],
         "Workpex": ["phone", "datetime", "agent", "order_id", "status", "product", "amount"],
         "3CX": ["phone", "datetime", "agent", "call_status", "duration", "direction"],
+        "Delivery CRM": ["tracking_id", "status", "amount", "agent", "delivery_partner", "country", "customer_name", "phone", "phone_secondary", "payment_method", "vendor", "product", "order_date", "outcome_date", "unpaid_date"],
     }[source]
     exact_defaults = {
         "DoubleTick": {"phone": "Phone number", "agent_number": "Agent Phone Number", "datetime": "Last message received at"},
         "Attribution": {"phone": "phone", "ad_id": "ad_id", "campaign": "meta_campaign_name", "status": "meta_lookup_status"},
         "Workpex": {"phone": "Primary Phone", "datetime": "Converted Date", "agent": "Assigned", "status": "Lead Status", "product": "Product", "amount": "Actual Amount"},
         "3CX": {"phone": "To", "datetime": "Call Time", "agent": "From", "call_status": "Status", "duration": "Talking", "direction": "Direction"},
+        "Delivery CRM": {"tracking_id": "TRACKING ID", "status": "CS STATUS", "amount": "VALUE", "agent": "AGENT", "delivery_partner": "DELIVERY AGENTS", "country": "COUNTRY", "customer_name": "CUSTOMER NAME", "phone": "NUMBER1", "phone_secondary": "NUMBER2", "payment_method": "PAYMENT METHOD", "vendor": "VENDOR", "product": "PRODUCT 1", "order_date": "DATE", "outcome_date": "Delivered/Cancelled Date_rto", "unpaid_date": "DEL/UNPAID DATE"},
     }
-    required = {"phone"}
+    required = {"tracking_id", "status"} if source == "Delivery CRM" else {"phone"}
     options = ["— Not available —"] + list(df.columns)
     mapping = {}
     cols = st.columns(3)
@@ -689,16 +692,18 @@ with st.sidebar:
     tz_options = ["Asia/Dubai", "Asia/Kolkata"]
     dt_tz = st.selectbox("DoubleTick", tz_options, 0, help="Used for lead-time and speed-to-call only. It never removes rows from the DoubleTick upload.")
     wp_tz = st.selectbox("Workpex", tz_options, 0)
+    delivery_tz = st.selectbox("Delivery CRM", tz_options, 0)
     cx_tz = st.selectbox("3CX", tz_options, 0)
 
 st.subheader("1. Upload source reports")
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 dt_file = c1.file_uploader("DoubleTick assignments", type=["csv", "xlsx", "xls", "zip"], help="Customer number + assigned agent number only")
 wp_file = c2.file_uploader("Workpex converted orders", type=["csv", "xlsx", "xls", "zip"])
-cx_file = c3.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "zip"], help="Leave blank to generate the sales and marketing report without call KPIs.")
+delivery_file = c3.file_uploader("Delivery CRM — closed & collected", type=["csv", "xlsx", "xls", "zip"], help="Required. One row per tracking ID; CS STATUS = Sale closed is treated as delivered and paid.")
+cx_file = c4.file_uploader("3CX calls (optional)", type=["csv", "xlsx", "xls", "zip"], help="Leave blank to generate the sales, delivery and marketing report without call KPIs.")
 
-if not all((dt_file, wp_file)):
-    st.info("Upload DoubleTick leads and Workpex converted orders. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")
+if not all((dt_file, wp_file, delivery_file)):
+    st.info("Upload DoubleTick leads, Workpex converted orders and Delivery CRM. 3CX is optional. Meta spend is fetched directly with META_ACCESS_TOKEN.")
     st.markdown("**Accepted:** CSV, Excel or ZIP containing CSV/Excel.")
     st.stop()
 
@@ -724,13 +729,14 @@ st.info("Report generation started. Reading the uploaded files now — the 141 M
 try:
     dt_frames = read_upload(dt_file)
     wp_frames = read_upload(wp_file)
+    delivery_frames = read_upload(delivery_file)
     cx_frames = read_upload(cx_file) if cx_file is not None else None
 except Exception as exc:
     st.error(f"Could not read an upload: {exc}"); st.stop()
 
 st.subheader("2. Confirm sheets and columns")
-source_names = ["DoubleTick", "Workpex"] + (["3CX"] if cx_frames is not None else [])
-source_frames = [dt_frames, wp_frames] + ([cx_frames] if cx_frames is not None else [])
+source_names = ["DoubleTick", "Workpex", "Delivery CRM"] + (["3CX"] if cx_frames is not None else [])
+source_frames = [dt_frames, wp_frames, delivery_frames] + ([cx_frames] if cx_frames is not None else [])
 tab_labels = [f"{name} mapping" if name != "DoubleTick" else "DoubleTick assignment mapping" for name in source_names]
 tabs = st.tabs(tab_labels)
 selected = {}
@@ -744,8 +750,10 @@ for tab, name, frames in zip(tabs, source_names, source_frames):
         with st.expander("Preview source rows"):
             st.dataframe(df.head(10), use_container_width=True)
 
-if any(not selected[name][1].get("phone") for name in selected):
-    st.error("A phone column is required for every source."); st.stop()
+if any(name != "Delivery CRM" and not selected[name][1].get("phone") for name in selected):
+    st.error("A phone column is required for DoubleTick, Workpex and 3CX."); st.stop()
+if not all(selected["Delivery CRM"][1].get(role) for role in ("tracking_id", "status")):
+    st.error("Delivery CRM requires Tracking ID and CS Status columns."); st.stop()
 
 dt_source, dt_mapping = selected["DoubleTick"]
 selected_time_column = dt_mapping.get("datetime")
@@ -813,6 +821,7 @@ if submitted:
     with st.spinner("Normalizing and matching reports…"):
         leads = normalize_leads(*selected["DoubleTick"], dt_tz, report_tz)
         sales = normalize_sales(*selected["Workpex"], wp_tz, report_tz)
+        delivery = normalize_delivery(*selected["Delivery CRM"], delivery_tz, report_tz)
         sales["order_from_generated_lead"] = sales["phone_key"].isin(set(leads["phone_key"]))
         sales["matched_lead_phone"] = sales["phone_key"].where(sales["order_from_generated_lead"], "")
         sales["order_source"] = sales["order_from_generated_lead"].map({
@@ -839,26 +848,26 @@ if submitted:
     leads = attach_attribution(leads, attribution)
     bar.empty()
     st.session_state["analysis_inputs"] = (
-        leads, sales, calls, call_start, call_end, report_tz, streak_gap,
+        leads, sales, delivery, calls, call_start, call_end, report_tz, streak_gap,
         filter_calls, agent_crosswalk, dt_report, start_date, end_date,
     )
 
 if "analysis_inputs" in st.session_state:
-    leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls, agent_crosswalk, dt_report, start_date, end_date = st.session_state["analysis_inputs"]
+    leads, sales, delivery, calls, call_start, call_end, report_tz, streak_gap, filter_calls, agent_crosswalk, dt_report, start_date, end_date = st.session_state["analysis_inputs"]
     joined, orders, calls_in_window = build_analysis(leads, sales, calls, call_start, call_end, report_tz, streak_gap, filter_calls=filter_calls)
-    ranges = {"DoubleTick upload": source_range(leads, "lead_time"), "Workpex upload": source_range(sales, "sale_time"), "3CX upload": source_range(calls, "call_time")}
+    ranges = {"DoubleTick upload": source_range(leads, "lead_time"), "Workpex upload": source_range(sales, "sale_time"), "Delivery CRM": source_range(delivery, "order_date"), "3CX upload": source_range(calls, "call_time")}
     qa = qa_report(leads, sales, calls, ranges)
     live_meta_spend, spend_errors = cached_meta_spend(
         meta_token, start_date, end_date, configured_meta_accounts()
     )
     spend_data, daily_spend, daily_campaign_spend = prepare_meta_spend_views(live_meta_spend)
     st.session_state["analysis_results"] = (
-        joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report,
+        joined, orders, delivery, calls_in_window, ranges, qa, agent_crosswalk, dt_report,
         spend_data, spend_errors, daily_spend, daily_campaign_spend,
     )
 elif "analysis_results" in st.session_state:
     (
-        joined, orders, calls_in_window, ranges, qa, agent_crosswalk, dt_report,
+        joined, orders, delivery, calls_in_window, ranges, qa, agent_crosswalk, dt_report,
         spend_data, spend_errors, daily_spend, daily_campaign_spend,
     ) = st.session_state["analysis_results"]
 else:
@@ -871,11 +880,11 @@ if joined.empty:
 # duplicate phone numbers: each uploaded row represents one reported lead.
 doubletick_report = joined.copy()
 
-if len({dt_tz, wp_tz} | ({cx_tz} if cx_file is not None else set())) > 1:
+if len({dt_tz, wp_tz, delivery_tz} | ({cx_tz} if cx_file is not None else set())) > 1:
     st.warning("Source timezones differ. Times were converted to the selected report timezone; verify those source timezone selections.")
 
 st.markdown(f"""<div class="hero"><h2>Performance command centre</h2><p>{len(doubletick_report):,} DoubleTick report leads · {pd.Timestamp(call_start).strftime('%d %b, %I:%M %p')} to {pd.Timestamp(call_end).strftime('%d %b, %I:%M %p')} · Dubai time</p></div>""", unsafe_allow_html=True)
-tabs = st.tabs(["Overview", "Marketing", "Sales", "3CX calls", "Agent scorecards", "Data quality"])
+tabs = st.tabs(["Overview", "Marketing", "Sales", "Delivery & cash", "3CX calls", "Agent scorecards", "Data quality"])
 
 with tabs[0]:
     total_leads, total_orders = len(doubletick_report), len(orders)
@@ -893,6 +902,18 @@ with tabs[0]:
     )
     metrics[2].metric("Orders from generated leads", f"{lead_orders:,}", f"{lead_orders / total_leads * 100:.1f}% of assigned leads")
     metrics[3].metric("Other-source orders", f"{other_source_orders:,}", f"{other_source_orders / total_orders * 100:.1f}% of orders" if total_orders else None)
+    delivery_window = delivery.copy()
+    if "order_date" in delivery_window and delivery_window["order_date"].notna().any():
+        delivery_window = delivery_window[
+            delivery_window["order_date"].between(call_start, call_end, inclusive="both")
+        ].copy()
+    cash = delivery_kpis(delivery_window)
+    st.markdown('<div class="section-label">Delivery and collected cash · unique tracking IDs</div>', unsafe_allow_html=True)
+    delivery_metrics = st.columns(4)
+    delivery_metrics[0].metric("Delivered & paid", f"{cash['paid_orders']:,}", "CS STATUS = Sale closed")
+    delivery_metrics[1].metric("Collected revenue", f"AED {cash['realized_revenue']:,.2f}")
+    delivery_metrics[2].metric("Delivered unpaid", f"{cash['unpaid_orders']:,}", f"AED {cash['unpaid_value']:,.2f} outstanding", delta_color="inverse")
+    delivery_metrics[3].metric("Cancelled / returned", f"{cash['cancelled_returned']:,}", f"{cash['return_rate']:.1f}% of resolved orders", delta_color="inverse")
     st.markdown('<div class="section-label">Call execution · GCC leads only</div>', unsafe_allow_html=True)
     call_metrics = st.columns(4)
     call_metrics[0].metric("GCC assigned", f"{len(gcc_leads):,}")
@@ -1034,6 +1055,65 @@ with tabs[2]:
     st.dataframe(orders.sort_values("sale_time", ascending=False), hide_index=True, use_container_width=True)
 
 with tabs[3]:
+    st.markdown("### Delivery, collections and returns")
+    st.caption("One row equals one unique tracking ID. Repeated customers remain separate orders. Reason and Notes never override CS STATUS.")
+    delivery_dates = delivery["order_date"].dropna() if "order_date" in delivery else pd.Series(dtype="datetime64[ns]")
+    delivery_view = delivery.copy()
+    if not delivery_dates.empty:
+        delivery_min, delivery_max = delivery_dates.min().date(), delivery_dates.max().date()
+        default_start = max(start_date, delivery_min)
+        default_end = min(end_date, delivery_max)
+        if default_start > default_end:
+            default_start, default_end = delivery_min, delivery_max
+        delivery_period = st.date_input(
+            "Delivery order-date range",
+            value=(default_start, default_end),
+            min_value=delivery_min, max_value=delivery_max,
+            format="DD/MM/YYYY", key="delivery_period",
+        )
+        if isinstance(delivery_period, (tuple, list)) and len(delivery_period) == 2:
+            delivery_start, delivery_end = delivery_period
+        else:
+            delivery_start = delivery_end = delivery_period
+        order_dates = delivery["order_date"].dt.date
+        delivery_view = delivery[order_dates.between(delivery_start, delivery_end, inclusive="both")].copy()
+    dk = delivery_kpis(delivery_view)
+    top = st.columns(4)
+    top[0].metric("Delivered & paid", f"{dk['paid_orders']:,}", "Sale closed")
+    top[1].metric("Collected revenue", f"AED {dk['realized_revenue']:,.2f}")
+    top[2].metric("Delivered unpaid", f"{dk['unpaid_orders']:,}", f"AED {dk['unpaid_value']:,.2f}", delta_color="inverse")
+    top[3].metric("Cancelled / returned", f"{dk['cancelled_returned']:,}", delta_color="inverse")
+    bottom = st.columns(4)
+    bottom[0].metric("All tracking IDs", f"{dk['orders']:,}")
+    bottom[1].metric("Delivery success", f"{dk['delivery_success_rate']:.1f}%")
+    bottom[2].metric("Collection rate", f"{dk['collection_rate']:.1f}%")
+    bottom[3].metric("Other / pending", f"{dk['pending_orders']:,}")
+
+    status_summary = delivery_view.groupby("delivery_status_raw", dropna=False).agg(
+        orders=("tracking_id", "size"), order_value=("order_value", "sum"),
+        realized_revenue=("realized_revenue", "sum"), unpaid_value=("unpaid_value", "sum"),
+    ).reset_index().sort_values("orders", ascending=False)
+    st.markdown("#### Exact CS status reconciliation")
+    st.dataframe(status_summary, hide_index=True, use_container_width=True)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Sales agent outcomes")
+        st.dataframe(delivery_summary(delivery_view, "sales_agent"), hide_index=True, use_container_width=True)
+    with right:
+        st.markdown("#### Delivery partner outcomes")
+        st.dataframe(delivery_summary(delivery_view, "delivery_partner"), hide_index=True, use_container_width=True)
+    detail_tabs = st.tabs(["Paid and collected", "Delivered unpaid", "Cancelled / returned", "All tracking IDs"])
+    detail_columns = [column for column in ["tracking_id", "order_date", "outcome_date", "sales_agent", "delivery_partner", "country", "customer_name", "customer_phone", "product", "order_value", "payment_method", "delivery_status_raw"] if column in delivery_view]
+    with detail_tabs[0]:
+        st.dataframe(delivery_view.loc[delivery_view.is_paid, detail_columns], hide_index=True, use_container_width=True)
+    with detail_tabs[1]:
+        st.dataframe(delivery_view.loc[delivery_view.is_delivered_unpaid, detail_columns], hide_index=True, use_container_width=True)
+    with detail_tabs[2]:
+        st.dataframe(delivery_view.loc[delivery_view.is_cancelled_returned, detail_columns], hide_index=True, use_container_width=True)
+    with detail_tabs[3]:
+        st.dataframe(delivery_view[detail_columns], hide_index=True, use_container_width=True)
+
+with tabs[4]:
     gcc_joined = joined[joined.lead_region.eq("GCC")]
     gcc_keys = set(joined.loc[joined.lead_region.eq("GCC"), "call_key"])
     gcc_calls = calls_in_window[calls_in_window.call_key.isin(gcc_keys)].copy()
@@ -1059,7 +1139,7 @@ with tabs[3]:
     else:
         st.dataframe(other_lead_detail, hide_index=True, use_container_width=True)
 
-with tabs[4]:
+with tabs[5]:
     total_by_agent = orders.groupby("sales_agent", dropna=False).size().rename("total_orders").astype(int)
     lead_by_agent = orders[orders.order_from_generated_lead].groupby("sales_agent", dropna=False).size().rename("lead_orders").astype(int)
     other_by_agent = orders[~orders.order_from_generated_lead].groupby("sales_agent", dropna=False).size().rename("other_orders").astype(int)
@@ -1102,7 +1182,7 @@ with tabs[4]:
     st.markdown('<div class="section-label">Full team comparison</div>', unsafe_allow_html=True)
     st.dataframe(agent_cards, hide_index=True, use_container_width=True, column_config={"conversion": st.column_config.ProgressColumn("Lead conversion %", min_value=0, max_value=100, format="%.1f%%"), "coverage": st.column_config.ProgressColumn("Call coverage %", min_value=0, max_value=100, format="%.1f%%")})
 
-with tabs[5]:
+with tabs[6]:
     st.markdown("#### Detected source ranges")
     range_table = pd.DataFrame([{"source": k, "first timestamp": v[0], "last timestamp": v[1]} for k, v in ranges.items()])
     st.dataframe(range_table, hide_index=True, use_container_width=True)
@@ -1121,7 +1201,7 @@ agent_report = grouped(joined, "agent")
 marketing_report = campaign_performance(joined, spend_data)
 missing_workpex = joined[~joined.workpex_found].copy()
 missing_attribution = joined[~joined.attribution_found].copy() if "attribution_found" in joined else joined.iloc[0:0]
-download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Leads_Without_Workpex_Order": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing_Performance": marketing_report, "Meta_API_Spend": spend_data, "Workpex_Orders": orders, "Calls": calls_in_window, "QA": qa})
+download = excel_bytes({"Joined_Lead_Detail": joined, "Missing_Attribution": missing_attribution, "Leads_Without_Workpex_Order": missing_workpex, "Agent_Performance": agent_report, "Agent_Directory": agent_crosswalk, "Marketing_Performance": marketing_report, "Meta_API_Spend": spend_data, "Workpex_Orders": orders, "Delivery_CRM": delivery, "Paid_Collected": delivery[delivery.is_paid], "Delivered_Unpaid": delivery[delivery.is_delivered_unpaid], "Cancelled_Returned": delivery[delivery.is_cancelled_returned], "Delivery_By_Agent": delivery_summary(delivery, "sales_agent"), "Delivery_By_Partner": delivery_summary(delivery, "delivery_partner"), "Calls": calls_in_window, "QA": qa})
 window_name = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}"
 st.download_button("Download complete analysis (.xlsx)", download, file_name=f"sales_marketing_analysis_{window_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 
