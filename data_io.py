@@ -19,6 +19,16 @@ SYNONYMS = {
     "call_status": ["call status", "result", "answered", "status", "disposition"],
     "duration": ["talking", "talk duration", "call duration", "duration", "talk time"],
     "direction": ["direction", "call direction"],
+    "tracking_id": ["tracking id", "tracking number", "awb", "order id", "order number"],
+    "delivery_partner": ["delivery agents", "delivery agent", "delivery partner", "courier", "3pl"],
+    "country": ["country", "market"],
+    "customer_name": ["customer name", "name"],
+    "phone_secondary": ["number2", "secondary phone", "alternate phone", "phone 2"],
+    "payment_method": ["payment method", "payment mode"],
+    "vendor": ["vendor", "supplier"],
+    "order_date": ["order date", "date"],
+    "outcome_date": ["delivered cancelled date rto", "delivered date", "closed date"],
+    "unpaid_date": ["del unpaid date", "unpaid date"],
 }
 
 
@@ -82,6 +92,7 @@ def choose_best_sheet(frames, role):
     if role == "3cx": wanted += ["call_status", "duration", "agent"]
     if role == "doubletick": wanted += ["agent", "ad_id", "campaign"]
     if role == "attribution": wanted += ["ad_id", "campaign"]
+    if role == "delivery crm": wanted = ["tracking_id", "status", "delivery_partner", "amount", "order_date"]
     for name, df in frames.items():
         scores[name] = sum(detect_column(df.columns, item) is not None for item in wanted) + min(len(df), 10_000) / 100_000
     selected = max(scores, key=scores.get)
