@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
 
 from historical_business import load_historical_dataset
@@ -30,25 +30,33 @@ def safe_div(a, b):
     return a / b if b else 0.0
 
 
-def summary(data: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    result = data.groupby(keys, as_index=False).agg(
+def summary(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    grouped = frame.groupby(keys, as_index=False, observed=True).agg(
         records=("source_row", "size"),
         leads=("customer_path", lambda x: x.eq("LEAD").sum()),
         orders=("is_order", "sum"),
         order_value=("order_value", "sum"),
         closed=("is_closed", "sum"),
-        closed_revenue=("final_revenue", lambda x: x[data.loc[x.index, "is_closed"]].sum()),
         cancelled=("is_cancelled", "sum"),
         pending=("is_pending", "sum"),
         unmatched=("crm_outcome", lambda x: x.eq("NOT FOUND IN CRM").sum()),
     )
-    result["lead_to_order_pct"] = result.apply(lambda r: pct(r.orders, r.leads), axis=1)
-    result["order_to_close_pct"] = result.apply(lambda r: pct(r.closed, r.orders), axis=1)
-    result["cancel_pct"] = result.apply(lambda r: pct(r.cancelled, r.orders), axis=1)
-    result["unmatched_pct"] = result.apply(lambda r: pct(r.unmatched, r.records), axis=1)
-    result["revenue_leakage"] = result["order_value"] - result["closed_revenue"]
-    result["avg_closed_value"] = result.apply(lambda r: safe_div(r.closed_revenue, r.closed), axis=1)
-    return result
+    closed_revenue = (
+        frame.loc[frame["is_closed"]]
+        .groupby(keys, observed=True)["final_revenue"]
+        .sum()
+        .rename("closed_revenue")
+        .reset_index()
+    )
+    grouped = grouped.merge(closed_revenue, on=keys, how="left")
+    grouped["closed_revenue"] = grouped["closed_revenue"].fillna(0.0)
+    grouped["lead_to_order_pct"] = np.where(grouped["leads"] > 0, grouped["orders"] / grouped["leads"] * 100, 0)
+    grouped["order_to_close_pct"] = np.where(grouped["orders"] > 0, grouped["closed"] / grouped["orders"] * 100, 0)
+    grouped["cancel_pct"] = np.where(grouped["orders"] > 0, grouped["cancelled"] / grouped["orders"] * 100, 0)
+    grouped["unmatched_pct"] = np.where(grouped["records"] > 0, grouped["unmatched"] / grouped["records"] * 100, 0)
+    grouped["revenue_leakage"] = grouped["order_value"] - grouped["closed_revenue"]
+    grouped["avg_closed_value"] = np.where(grouped["closed"] > 0, grouped["closed_revenue"] / grouped["closed"], 0)
+    return grouped
 
 
 def zscore(series: pd.Series) -> pd.Series:
@@ -61,7 +69,7 @@ def zscore(series: pd.Series) -> pd.Series:
 
 st.markdown(
     '<div class="hero"><h1>Deep-Dive Analytics & Root-Cause Diagnostics</h1>'
-    '<p>Filter from year to month to agent, product, vendor, country and customer path, then identify exact success and failure drivers.</p></div>',
+    '<p>Apply filters once, then open only the analysis you need. Heavy sections are calculated on demand.</p></div>',
     unsafe_allow_html=True,
 )
 
@@ -72,176 +80,127 @@ if data.empty:
     st.error("Historical dataset is empty.")
     st.stop()
 
-# Global synchronized filters
-st.sidebar.header("Global Filters")
-years = sorted(data["month"].str[:4].astype(int).unique())
-selected_years = st.sidebar.multiselect("Year", years, default=years)
-working = data[data["month"].str[:4].astype(int).isin(selected_years)].copy()
+data = data.copy(deep=False)
+year_values = pd.to_numeric(data["month"].astype(str).str[:4], errors="coerce")
+all_years = sorted(year_values.dropna().astype(int).unique().tolist())
+all_months = sorted(data["month"].dropna().astype(str).unique().tolist())
 
-months = sorted(working["month"].dropna().unique())
-selected_months = st.sidebar.multiselect("Month", months, default=months)
-working = working[working["month"].isin(selected_months)]
+if "deep_filters" not in st.session_state:
+    st.session_state.deep_filters = {
+        "years": all_years,
+        "months": all_months,
+        "agent": [],
+        "product": [],
+        "vendor": [],
+        "country": [],
+        "customer_path": [],
+    }
 
-for column, label in [
-    ("agent", "Agent"),
-    ("product", "Product"),
-    ("vendor", "Vendor"),
-    ("country", "Country"),
-    ("customer_path", "Customer Path"),
-]:
-    options = sorted(working[column].dropna().astype(str).unique())
-    chosen = st.sidebar.multiselect(label, options, default=[])
-    if chosen:
-        working = working[working[column].isin(chosen)]
+with st.sidebar.form("deep_dive_filters"):
+    st.header("Global Filters")
+    chosen_years = st.multiselect("Year", all_years, default=st.session_state.deep_filters["years"])
+    eligible_months = [m for m in all_months if int(str(m)[:4]) in chosen_years] if chosen_years else all_months
+    previous_months = [m for m in st.session_state.deep_filters["months"] if m in eligible_months]
+    chosen_months = st.multiselect("Month", eligible_months, default=previous_months or eligible_months)
+    selections = {}
+    for column, label in [
+        ("agent", "Agent"), ("product", "Product"), ("vendor", "Vendor"),
+        ("country", "Country"), ("customer_path", "Customer Path"),
+    ]:
+        options = sorted(data[column].dropna().astype(str).unique().tolist())
+        defaults = [x for x in st.session_state.deep_filters[column] if x in options]
+        selections[column] = st.multiselect(label, options, default=defaults)
+    applied = st.form_submit_button("Apply filters", use_container_width=True)
+
+if applied:
+    st.session_state.deep_filters = {
+        "years": chosen_years,
+        "months": chosen_months,
+        **selections,
+    }
+
+filters = st.session_state.deep_filters
+mask = pd.Series(True, index=data.index)
+if filters["years"]:
+    mask &= year_values.isin(filters["years"])
+if filters["months"]:
+    mask &= data["month"].astype(str).isin(filters["months"])
+for column in ["agent", "product", "vendor", "country", "customer_path"]:
+    if filters[column]:
+        mask &= data[column].astype(str).isin(filters[column])
+working = data.loc[mask]
 
 if working.empty:
-    st.warning("No records match the selected filters.")
+    st.warning("No records match the applied filters.")
     st.stop()
 
-month_summary = summary(working, ["month"]).sort_values("month")
-
+closed_revenue_total = working.loc[working["is_closed"], "final_revenue"].sum()
 k = st.columns(8)
 k[0].metric("Records", f"{len(working):,}")
 k[1].metric("Meta leads", f"{int((working['customer_path'] == 'LEAD').sum()):,}")
 k[2].metric("Orders", f"{int(working['is_order'].sum()):,}")
 k[3].metric("Closed", f"{int(working['is_closed'].sum()):,}")
 k[4].metric("Cancelled", f"{int(working['is_cancelled'].sum()):,}")
-k[5].metric("Closed revenue", f"AED {working.loc[working['is_closed'], 'final_revenue'].sum():,.2f}")
-k[6].metric("Leakage", f"AED {(working['order_value'].sum() - working.loc[working['is_closed'], 'final_revenue'].sum()):,.2f}")
+k[5].metric("Closed revenue", f"AED {closed_revenue_total:,.2f}")
+k[6].metric("Leakage", f"AED {(working['order_value'].sum() - closed_revenue_total):,.2f}")
 k[7].metric("CRM unmatched", f"{int((working['crm_outcome'] == 'NOT FOUND IN CRM').sum()):,}")
 
-# Month comparison and failure reasons
-main_tabs = st.tabs([
-    "Month Comparison",
-    "Root Cause",
-    "Anomalies",
-    "Agent Drilldown",
-    "Product Drilldown",
-    "Vendor Drilldown",
-    "Country Drilldown",
-    "Customer Path",
-    "CRM Outcomes",
-    "Row-Level Data",
-])
+view = st.selectbox(
+    "Analysis view",
+    [
+        "Month Comparison", "Root Cause", "Anomalies", "Agent Drilldown",
+        "Product Drilldown", "Vendor Drilldown", "Country Drilldown",
+        "Customer Path", "CRM Outcomes", "Row-Level Data",
+    ],
+)
 
-with main_tabs[0]:
+if view in {"Month Comparison", "Anomalies"}:
+    month_summary = summary(working, ["month"]).sort_values("month")
+
+if view == "Month Comparison":
     st.dataframe(month_summary, hide_index=True, use_container_width=True)
     st.line_chart(month_summary.set_index("month")[["lead_to_order_pct", "order_to_close_pct", "cancel_pct", "unmatched_pct"]])
     st.line_chart(month_summary.set_index("month")[["closed_revenue", "revenue_leakage"]])
-
-    if len(month_summary) >= 2:
-        compare_cols = st.columns(2)
-        month_a = compare_cols[0].selectbox("Compare month A", month_summary["month"].tolist(), index=max(0, len(month_summary) - 2))
-        month_b = compare_cols[1].selectbox("Compare month B", month_summary["month"].tolist(), index=len(month_summary) - 1)
-        a = month_summary[month_summary["month"] == month_a].iloc[0]
-        b = month_summary[month_summary["month"] == month_b].iloc[0]
-        compare = pd.DataFrame({
-            "Metric": ["Leads", "Orders", "Closed", "Closed Revenue", "Lead→Order %", "Order→Close %", "Cancel %", "Leakage"],
-            month_a: [a.leads, a.orders, a.closed, a.closed_revenue, a.lead_to_order_pct, a.order_to_close_pct, a.cancel_pct, a.revenue_leakage],
-            month_b: [b.leads, b.orders, b.closed, b.closed_revenue, b.lead_to_order_pct, b.order_to_close_pct, b.cancel_pct, b.revenue_leakage],
-        })
-        compare["Difference"] = compare[month_b] - compare[month_a]
-        st.dataframe(compare, hide_index=True, use_container_width=True)
-
-with main_tabs[1]:
+elif view == "Root Cause":
     root = summary(working, ["month", "agent", "product", "vendor", "country"])
     root["failure_score"] = (
-        root["cancel_pct"] * 0.35
-        + root["unmatched_pct"] * 0.20
+        root["cancel_pct"] * 0.35 + root["unmatched_pct"] * 0.20
         + zscore(root["revenue_leakage"]).clip(lower=0) * 20
         + (100 - root["order_to_close_pct"]) * 0.25
     )
     st.markdown("#### Highest-impact failure combinations")
-    st.dataframe(
-        root.sort_values(["failure_score", "revenue_leakage"], ascending=False).head(250),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    reasons = working[working["is_cancelled"]].groupby(
-        ["reason", "product", "country"], as_index=False
+    st.dataframe(root.nlargest(250, "failure_score"), hide_index=True, use_container_width=True)
+    reasons = working.loc[working["is_cancelled"]].groupby(
+        ["reason", "product", "country"], as_index=False, observed=True
     ).agg(cases=("source_row", "size"), lost_value=("order_value", "sum"))
-    st.markdown("#### Exact cancellation causes by product and country")
-    st.dataframe(reasons.sort_values(["lost_value", "cases"], ascending=False).head(200), hide_index=True, use_container_width=True)
-
-with main_tabs[2]:
+    st.markdown("#### Exact cancellation causes")
+    st.dataframe(reasons.nlargest(200, "lost_value"), hide_index=True, use_container_width=True)
+elif view == "Anomalies":
     anomaly = month_summary.copy()
     for column in ["closed_revenue", "revenue_leakage", "cancel_pct", "order_to_close_pct", "unmatched_pct"]:
         anomaly[f"{column}_z"] = zscore(anomaly[column])
-    anomaly["anomaly_score"] = (
-        anomaly["closed_revenue_z"].abs()
-        + anomaly["revenue_leakage_z"].abs()
-        + anomaly["cancel_pct_z"].abs()
-        + anomaly["order_to_close_pct_z"].abs()
-        + anomaly["unmatched_pct_z"].abs()
-    )
+    anomaly["anomaly_score"] = sum(anomaly[f"{c}_z"].abs() for c in ["closed_revenue", "revenue_leakage", "cancel_pct", "order_to_close_pct", "unmatched_pct"])
     st.dataframe(anomaly.sort_values("anomaly_score", ascending=False), hide_index=True, use_container_width=True)
-
-    if not anomaly.empty:
-        top = anomaly.sort_values("anomaly_score", ascending=False).iloc[0]
-        findings = [
-            f"Most unusual month: {top['month']}.",
-            f"Closed revenue: AED {top['closed_revenue']:,.2f}.",
-            f"Cancellation rate: {top['cancel_pct']:.1f}%.",
-            f"Revenue leakage: AED {top['revenue_leakage']:,.2f}.",
-            f"CRM unmatched rate: {top['unmatched_pct']:.1f}%.",
-        ]
-        for finding in findings:
-            st.markdown(f'<div class="finding">{finding}</div>', unsafe_allow_html=True)
-
-with main_tabs[3]:
-    agent = summary(working, ["agent"])
-    st.dataframe(agent.sort_values(["closed", "orders"], ascending=False), hide_index=True, use_container_width=True)
-
-with main_tabs[4]:
-    product = summary(working, ["product"])
-    st.dataframe(product.sort_values("closed_revenue", ascending=False), hide_index=True, use_container_width=True)
-
-with main_tabs[5]:
-    vendor = summary(working, ["vendor"])
-    st.dataframe(vendor.sort_values("closed_revenue", ascending=False), hide_index=True, use_container_width=True)
-
-with main_tabs[6]:
-    country = summary(working, ["country"])
-    st.dataframe(country.sort_values("closed_revenue", ascending=False), hide_index=True, use_container_width=True)
-
-with main_tabs[7]:
-    path = summary(working, ["customer_path"])
-    st.dataframe(path.sort_values("records", ascending=False), hide_index=True, use_container_width=True)
-
-with main_tabs[8]:
-    outcomes = working.groupby("crm_outcome", as_index=False).agg(
-        records=("source_row", "size"),
-        order_value=("order_value", "sum"),
-        final_revenue=("final_revenue", "sum"),
+elif view.endswith("Drilldown"):
+    dimension = view.split()[0].lower()
+    result = summary(working, [dimension])
+    st.dataframe(result.sort_values(["closed_revenue", "closed"], ascending=False), hide_index=True, use_container_width=True)
+elif view == "Customer Path":
+    st.dataframe(summary(working, ["customer_path"]).sort_values("records", ascending=False), hide_index=True, use_container_width=True)
+elif view == "CRM Outcomes":
+    outcomes = working.groupby("crm_outcome", as_index=False, observed=True).agg(
+        records=("source_row", "size"), order_value=("order_value", "sum"), final_revenue=("final_revenue", "sum")
     )
     outcomes["share_pct"] = outcomes["records"] / len(working) * 100
     st.dataframe(outcomes.sort_values("records", ascending=False), hide_index=True, use_container_width=True)
-
-with main_tabs[9]:
+else:
     visible_columns = [
-        "month", "date", "agent", "customer_path", "phone", "phone_2", "product", "quantity",
-        "order_value", "status_raw", "is_order", "country", "vendor", "crm_outcome",
-        "crm_status_raw", "crm_value", "final_revenue", "reason", "tracking_number", "em_number",
+        "month", "date", "agent", "customer_path", "phone", "phone_2", "product",
+        "quantity", "order_value", "status_raw", "is_order", "country", "vendor",
+        "crm_outcome", "crm_status_raw", "crm_value", "final_revenue", "reason",
+        "tracking_number", "em_number",
     ]
     available = [column for column in visible_columns if column in working.columns]
-    st.dataframe(working[available], hide_index=True, use_container_width=True)
-
-st.markdown("### Automated improvement recommendations")
-
-best_month = month_summary.loc[month_summary["closed_revenue"].idxmax()]
-worst_cancel = month_summary.loc[month_summary["cancel_pct"].idxmax()]
-worst_leak = month_summary.loc[month_summary["revenue_leakage"].idxmax()]
-best_close = month_summary.loc[month_summary["order_to_close_pct"].idxmax()]
-
-recommendations = [
-    f"Replicate the agent, product, vendor and country mix from {best_month['month']}, the highest-revenue month.",
-    f"Use {best_close['month']} as the operational close-rate benchmark and compare weaker months against it.",
-    f"Prioritize a cancellation audit for {worst_cancel['month']}, where cancellation reached {worst_cancel['cancel_pct']:.1f}%.",
-    f"Investigate every high-value order from {worst_leak['month']}, which produced AED {worst_leak['revenue_leakage']:,.2f} revenue leakage.",
-    "Assign owners to the top cancellation reasons and review their case counts and lost value every month.",
-    "Require a final CRM outcome for all agent-created orders before closing monthly reporting.",
-    "Scale campaigns only when lead-to-order, order-to-close and final revenue improve together.",
-]
-for recommendation in recommendations:
-    st.markdown(f'<div class="finding">{recommendation}</div>', unsafe_allow_html=True)
+    limit = st.number_input("Rows to display", min_value=100, max_value=5000, value=500, step=100)
+    st.caption(f"Showing {min(int(limit), len(working)):,} of {len(working):,} filtered rows.")
+    st.dataframe(working[available].head(int(limit)), hide_index=True, use_container_width=True)
