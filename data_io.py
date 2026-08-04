@@ -53,9 +53,37 @@ def detect_column(columns, role):
 def _read_one(name, raw):
     suffix = Path(name).suffix.lower()
     if suffix == ".csv":
-        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        # Most source exports are ordinary comma-delimited CSVs.  Trying
+        # ``sep=None`` first is unsafe for large CRM exports: pandas' Python
+        # sniffer can infer the wrong delimiter when early rows contain a
+        # different number of populated columns.  The Delivery CRM sample is
+        # one such file (34 real comma-delimited columns, but only 26 values in
+        # some opening rows).  Prefer explicit delimiters and use sniffing only
+        # as a final compatibility fallback.
+        attempts = (
+            ("utf-8-sig", ",", "c"),
+            ("utf-8", ",", "c"),
+            ("utf-8-sig", ";", "c"),
+            ("utf-8-sig", "\t", "c"),
+            ("latin-1", ",", "c"),
+            ("latin-1", ";", "c"),
+            ("latin-1", "\t", "c"),
+            ("utf-8-sig", None, "python"),
+            ("latin-1", None, "python"),
+        )
+        for encoding, separator, engine in attempts:
             try:
-                return {Path(name).stem: pd.read_csv(io.BytesIO(raw), encoding=encoding, sep=None, engine="python")}
+                frame = pd.read_csv(
+                    io.BytesIO(raw),
+                    encoding=encoding,
+                    sep=separator,
+                    engine=engine,
+                    low_memory=False if engine == "c" else None,
+                )
+                # A wrong explicit delimiter normally produces one giant
+                # column.  Reject that result so the next delimiter is tried.
+                if len(frame.columns) > 1:
+                    return {Path(name).stem: frame}
             except (UnicodeDecodeError, pd.errors.ParserError):
                 continue
         raise ValueError(f"Could not decode {name}")
@@ -129,3 +157,4 @@ def parse_duration_seconds(series):
         except ValueError: pass
         return 0.0
     return series.map(one)
+
