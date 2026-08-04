@@ -17,7 +17,7 @@ st.markdown(
     """
     <style>
     .block-container{padding-top:1rem;max-width:1550px}
-    [data-testid="stMetric"]{background:white;border:1px solid #e5e9ef;padding:15px;border-radius:16px}
+    [data-testid="stMetric"]{background:white;border:1px solid #e5e9ef;padding:15px;border-radius:16px;min-height:128px}\n    [data-testid="stMetricValue"]{font-size:clamp(1.35rem,2.15vw,2.35rem);white-space:nowrap;overflow:visible;text-overflow:clip}
     .strategy-hero{padding:24px;border-radius:20px;background:linear-gradient(120deg,#102a43,#176b87);color:white;margin-bottom:16px}
     .strategy-hero h1,.strategy-hero h2{color:white;margin:0 0 8px}.strategy-hero p{margin:0;color:#d9edf4}
     .insight-box{border-left:5px solid #d7a928;padding:14px 16px;background:#fffaf0;border-radius:10px;margin:8px 0}
@@ -57,27 +57,47 @@ def ratio(numerator, denominator):
     return numerator / denominator * 100 if denominator else 0.0
 
 
+def _crm_order_key(frame: pd.DataFrame) -> pd.Series:
+    """Count each CRM outcome once when one phone matches several lead rows."""
+    crm_row = pd.to_numeric(frame.get("source_row_crm"), errors="coerce")
+    month = frame["month"].astype("string")
+    crm_key = month + ":CRM:" + crm_row.astype("Int64").astype("string")
+    lead_key = month + ":LEAD:" + frame["source_row"].astype("Int64").astype("string")
+    has_crm = crm_row.notna() & ~frame["crm_outcome"].eq("NOT FOUND IN CRM")
+    return crm_key.where(has_crm, lead_key.where(frame["is_order"], pd.NA))
+
+
 def monthly_summary(data: pd.DataFrame) -> pd.DataFrame:
-    summary = data.groupby("month", as_index=False).agg(
-        records=("source_row", "size"),
-        meta_leads=("customer_path", lambda values: values.eq("LEAD").sum()),
-        orders=("is_order", "sum"),
-        order_value=("order_value", "sum"),
-        closed_sales=("is_closed", "sum"),
-        closed_revenue=("final_revenue", lambda values: values[data.loc[values.index, "is_closed"]].sum()),
-        cancelled=("is_cancelled", "sum"),
-        pending=("is_pending", "sum"),
-        unmatched=("crm_outcome", lambda values: values.eq("NOT FOUND IN CRM").sum()),
-    )
-    summary["lead_to_order_pct"] = summary.apply(lambda row: ratio(row["orders"], row["meta_leads"]), axis=1)
+    work = data.copy()
+    work["_order_key"] = _crm_order_key(work)
+    rows = []
+    for month, group in work.groupby("month", sort=True):
+        order_rows = group[group["_order_key"].notna()].drop_duplicates("_order_key", keep="first")
+        closed_rows = group[group["is_closed"] & group["_order_key"].notna()].drop_duplicates("_order_key", keep="first")
+        cancelled_rows = group[group["is_cancelled"] & group["_order_key"].notna()].drop_duplicates("_order_key", keep="first")
+        pending_rows = group[group["is_pending"] & group["_order_key"].notna()].drop_duplicates("_order_key", keep="first")
+        rows.append({
+            "month": month,
+            "records": int(len(group)),
+            "meta_leads": int(group["customer_path"].eq("LEAD").sum()),
+            "orders": int(order_rows["_order_key"].nunique()),
+            "order_value": float(pd.to_numeric(order_rows["order_value"], errors="coerce").fillna(0).sum()),
+            "closed_sales": int(closed_rows["_order_key"].nunique()),
+            "closed_revenue": float(pd.to_numeric(closed_rows["final_revenue"], errors="coerce").fillna(0).sum()),
+            "cancelled": int(cancelled_rows["_order_key"].nunique()),
+            "pending": int(pending_rows["_order_key"].nunique()),
+            "unmatched": int(group["crm_outcome"].eq("NOT FOUND IN CRM").sum()),
+        })
+    summary = pd.DataFrame(rows)
+    summary["lead_to_order_pct"] = summary.apply(lambda row: ratio(row["orders"], row["records"]), axis=1)
     summary["order_to_close_pct"] = summary.apply(lambda row: ratio(row["closed_sales"], row["orders"]), axis=1)
     summary["cancel_pct"] = summary.apply(lambda row: ratio(row["cancelled"], row["orders"]), axis=1)
-    summary["revenue_leakage"] = summary["order_value"] - summary["closed_revenue"]
+    summary["unclosed_orders"] = (summary["orders"] - summary["closed_sales"]).clip(lower=0)
+    summary["revenue_leakage"] = 0.0
     summary["year"] = summary["month"].str[:4].astype(int)
     summary["month_num"] = summary["month"].str[-2:].astype(int)
     summary["quarter"] = "Q" + (((summary["month_num"] - 1) // 3) + 1).astype(str)
     return summary.sort_values("month")
-
 
 def attach_meta_spend(summary: pd.DataFrame, meta_spend: pd.DataFrame) -> pd.DataFrame:
     output = summary.copy()
@@ -239,13 +259,15 @@ if not best_roas.empty:
     row = best_roas.iloc[0]
     insight_lines.append(f"Highest Meta ROAS month: {row['month']} at {row['roas']:.2f}×.")
 
-kpis = st.columns(6)
-kpis[0].metric("Historical leads", f"{int(summary['meta_leads'].sum()):,}")
-kpis[1].metric("Agent orders", f"{int(summary['orders'].sum()):,}")
-kpis[2].metric("Sales closed", f"{int(summary['closed_sales'].sum()):,}")
-kpis[3].metric("Closed revenue", f"AED {summary['closed_revenue'].sum():,.2f}")
-kpis[4].metric("Revenue leakage", f"AED {summary['revenue_leakage'].sum():,.2f}")
-kpis[5].metric("Meta ROAS", f"{summary['closed_revenue'].sum() / summary['meta_spend'].sum():.2f}×" if summary['meta_spend'].sum() else "N/A")
+kpi_row_1 = st.columns(3)
+kpi_row_1[0].metric("Historical lead rows", f"{int(summary['records'].sum()):,}")
+kpi_row_1[1].metric("Reconciled orders", f"{int(summary['orders'].sum()):,}")
+kpi_row_1[2].metric("Unique sales closed", f"{int(summary['closed_sales'].sum()):,}")
+
+kpi_row_2 = st.columns(3)
+kpi_row_2[0].metric("Closed revenue", f"AED {summary['closed_revenue'].sum():,.2f}")
+kpi_row_2[1].metric("Orders not closed", f"{int(summary['unclosed_orders'].sum()):,}")
+kpi_row_2[2].metric("Meta ROAS", f"{summary['closed_revenue'].sum() / summary['meta_spend'].sum():.2f}×" if summary['meta_spend'].sum() else "N/A")
 
 for line in insight_lines:
     st.markdown(f'<div class="insight-box">{line}</div>', unsafe_allow_html=True)
@@ -310,8 +332,8 @@ with tabs[2]:
         st.warning("Some Meta accounts or periods could not be fetched: " + " | ".join(meta_errors))
 
 with tabs[3]:
-    st.dataframe(summary[["month", "orders", "order_value", "closed_sales", "closed_revenue", "cancelled", "revenue_leakage"]], hide_index=True, use_container_width=True)
-    st.bar_chart(summary.set_index("month")[["closed_revenue", "revenue_leakage"]])
+    st.dataframe(summary[["month", "records", "orders", "closed_sales", "unclosed_orders", "closed_revenue", "cancelled"]], hide_index=True, use_container_width=True)
+    st.bar_chart(summary.set_index("month")[["orders", "closed_sales", "unclosed_orders"]])
 
 with tabs[4]:
     st.dataframe(agent.sort_values(["closed_sales", "orders"], ascending=False), hide_index=True, use_container_width=True)
