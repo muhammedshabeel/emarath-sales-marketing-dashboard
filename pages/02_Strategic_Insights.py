@@ -169,11 +169,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if not st.session_state.get("strategic_dataset_open", False):
+    st.info("This analysis uses the large multi-year dataset. Open it only when needed.")
+    if st.button("Open strategic analysis", type="primary", use_container_width=True):
+        st.session_state["strategic_dataset_open"] = True
+        st.rerun()
+    st.stop()
+
 try:
     with st.spinner("Opening the preprocessed historical dataset…"):
         dataset = load_historical_dataset()
-except Exception as exc:
-    st.error(f"Could not open historical dataset: {exc}")
+except (MemoryError, Exception) as exc:
+    st.session_state["strategic_dataset_open"] = False
+    st.error(f"Historical data could not be opened safely: {exc}")
+    st.info("The current-operations dashboard remains available. Retry this page after the app recovers.")
     st.stop()
 
 if dataset.empty:
