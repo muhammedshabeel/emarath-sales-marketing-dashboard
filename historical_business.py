@@ -330,29 +330,39 @@ def render_historical_business(
     crm: pd.DataFrame,
     meta_spend: pd.DataFrame,
     selected_month: str,
+    selected_view: str = "Executive overview",
 ) -> None:
+    """Render only the requested section.
+
+    Streamlit tabs execute every tab body on every rerun. Historical data is large,
+    so a single-view renderer keeps navigation responsive and avoids constructing
+    hidden charts and full row-level tables.
+    """
     if "crm_outcome" in leads.columns:
-        joined = leads[leads["month"].eq(selected_month)].copy()
+        joined = leads.loc[leads["month"].eq(selected_month)].copy()
     else:
-        joined = preprocess_historical_dataset(
-            leads[leads["month"].eq(selected_month)].copy(),
-            crm[crm["month"].eq(selected_month)].copy(),
-        )
+        month_leads = leads.loc[leads["month"].eq(selected_month)].copy()
+        month_crm = crm.loc[crm["month"].eq(selected_month)].copy()
+        joined = preprocess_historical_dataset(month_leads, month_crm)
 
     if joined.empty:
         st.warning("No historical lead rows were found for this month.")
         return
 
-    new_leads = joined[joined["customer_path"].eq("LEAD")]
-    orders = joined[joined["is_order"]]
-    closed = joined[joined["is_closed"]]
-    cancelled = joined[joined["is_cancelled"]]
-    pending = joined[joined["is_pending"]]
+    new_leads = joined.loc[joined["customer_path"].eq("LEAD")]
+    orders = joined.loc[joined["is_order"]]
+    closed = joined.loc[joined["is_closed"]]
+    cancelled = joined.loc[joined["is_cancelled"]]
+    pending = joined.loc[joined["is_pending"]]
 
-    total_spend = float(meta_spend["spend"].sum()) if not meta_spend.empty and "spend" in meta_spend.columns else 0.0
-    order_value = float(orders["order_value"].sum())
-    closed_revenue = float(closed["final_revenue"].sum())
-    cpl = total_spend / len(new_leads) if len(new_leads) else 0.0
+    total_spend = (
+        float(pd.to_numeric(meta_spend["spend"], errors="coerce").fillna(0).sum())
+        if not meta_spend.empty and "spend" in meta_spend.columns
+        else 0.0
+    )
+    order_value = float(pd.to_numeric(orders["order_value"], errors="coerce").fillna(0).sum())
+    closed_revenue = float(pd.to_numeric(closed["final_revenue"], errors="coerce").fillna(0).sum())
+    cpl = total_spend / len(new_leads) if len(new_leads) and total_spend else 0.0
     order_rate = len(orders) / len(new_leads) * 100 if len(new_leads) else 0.0
     close_rate = len(closed) / len(orders) * 100 if len(orders) else 0.0
     cancel_rate = len(cancelled) / len(orders) * 100 if len(orders) else 0.0
@@ -360,41 +370,37 @@ def render_historical_business(
 
     st.markdown(
         f'<div class="hero"><h2>Historical business command centre</h2><p>'
-        f'{pd.Period(selected_month).strftime("%B %Y")} · Preprocessed leads + Sales CRM outcomes + Meta spend</p></div>',
+        f'{pd.Period(selected_month).strftime("%B %Y")} · Preprocessed leads + Sales CRM outcomes'
+        f'{" + Meta spend" if total_spend else ""}</p></div>',
         unsafe_allow_html=True,
     )
 
-    tabs = st.tabs([
-        "Executive overview",
-        "Customer paths",
-        "Sales CRM outcomes",
-        "Agents",
-        "Marketing",
-        "Insights & data",
-    ])
-
-    with tabs[0]:
+    if selected_view == "Executive overview":
         row1 = st.columns(5)
         row1[0].metric("New leads", f"{len(new_leads):,}")
-        row1[1].metric("Meta spend", f"AED {total_spend:,.2f}")
-        row1[2].metric("CPL", f"AED {cpl:,.2f}" if len(new_leads) else "N/A")
-        row1[3].metric("Agent-created orders", f"{len(orders):,}", f"{order_rate:.1f}% of leads")
-        row1[4].metric("Initial order value", f"AED {order_value:,.2f}")
+        row1[1].metric("Agent-created orders", f"{len(orders):,}", f"{order_rate:.1f}% of leads")
+        row1[2].metric("Initial order value", f"AED {order_value:,.2f}")
+        row1[3].metric("Final sales closed", f"{len(closed):,}", f"{close_rate:.1f}% of orders")
+        row1[4].metric("Final closed revenue", f"AED {closed_revenue:,.2f}")
 
         row2 = st.columns(5)
-        row2[0].metric("Final sales closed", f"{len(closed):,}", f"{close_rate:.1f}% of orders")
-        row2[1].metric("Final closed revenue", f"AED {closed_revenue:,.2f}")
-        row2[2].metric("Cancelled / returned", f"{len(cancelled):,}", f"{cancel_rate:.1f}% of orders")
-        row2[3].metric("Pending / in process", f"{len(pending):,}")
-        row2[4].metric("Final Meta ROAS", f"{roas:.2f}×" if total_spend else "N/A")
+        row2[0].metric("Cancelled / returned", f"{len(cancelled):,}", f"{cancel_rate:.1f}% of orders")
+        row2[1].metric("Pending / in process", f"{len(pending):,}")
+        row2[2].metric("Meta spend", f"AED {total_spend:,.2f}" if total_spend else "Not loaded")
+        row2[3].metric("CPL", f"AED {cpl:,.2f}" if cpl else "Not loaded")
+        row2[4].metric("Final Meta ROAS", f"{roas:.2f}×" if roas else "Not loaded")
 
         funnel = pd.DataFrame({
             "Stage": ["New leads", "Agent-created orders", "Final sales closed"],
             "Count": [len(new_leads), len(orders), len(closed)],
         })
-        st.plotly_chart(px.funnel(funnel, x="Count", y="Stage", title="Business conversion funnel"), use_container_width=True)
+        st.plotly_chart(
+            px.funnel(funnel, x="Count", y="Stage", title="Business conversion funnel"),
+            use_container_width=True,
+        )
+        return
 
-    with tabs[1]:
+    if selected_view == "Customer paths":
         path = joined.groupby("customer_path", as_index=False).agg(
             records=("source_row", "size"),
             orders=("is_order", "sum"),
@@ -406,24 +412,31 @@ def render_historical_business(
         path["final_close_pct"] = path["closed_sales"].div(path["orders"].replace(0, pd.NA)).mul(100)
         st.dataframe(path.sort_values("records", ascending=False), hide_index=True, use_container_width=True)
         st.plotly_chart(
-            px.bar(path, x="customer_path", y=["records", "orders", "closed_sales"], barmode="group", title="Customer-path performance"),
+            px.bar(
+                path,
+                x="customer_path",
+                y=["records", "orders", "closed_sales"],
+                barmode="group",
+                title="Customer-path performance",
+            ),
             use_container_width=True,
         )
-        st.caption("Only LEAD is used as the Meta CPL denominator. Other customer paths remain separate business metrics.")
+        st.caption("Only LEAD is used as the Meta CPL denominator. Other customer paths remain separate.")
+        return
 
-    with tabs[2]:
+    if selected_view == "Sales CRM outcomes":
         outcomes = joined.groupby("crm_outcome", as_index=False).agg(
             records=("source_row", "size"),
             amount=("final_revenue", "sum"),
         )
         outcomes["share_pct"] = outcomes["records"].div(len(joined)).mul(100)
         st.dataframe(outcomes.sort_values("records", ascending=False), hide_index=True, use_container_width=True)
-
         reasons = cancelled.groupby("reason", as_index=False).size().sort_values("size", ascending=False)
         st.markdown("#### Cancellation and rejection reasons")
-        st.dataframe(reasons, hide_index=True, use_container_width=True)
+        st.dataframe(reasons.head(100), hide_index=True, use_container_width=True)
+        return
 
-    with tabs[3]:
+    if selected_view == "Agents":
         agent = joined.groupby("agent", as_index=False).agg(
             handled=("source_row", "size"),
             new_leads=("customer_path", lambda values: values.eq("LEAD").sum()),
@@ -435,9 +448,16 @@ def render_historical_business(
         )
         agent["lead_to_order_pct"] = agent["orders"].div(agent["new_leads"].replace(0, pd.NA)).mul(100)
         agent["order_to_close_pct"] = agent["closed_sales"].div(agent["orders"].replace(0, pd.NA)).mul(100)
-        st.dataframe(agent.sort_values(["closed_sales", "orders"], ascending=False), hide_index=True, use_container_width=True)
+        st.dataframe(
+            agent.sort_values(["closed_sales", "orders"], ascending=False),
+            hide_index=True,
+            use_container_width=True,
+        )
+        return
 
-    with tabs[4]:
+    if selected_view == "Marketing":
+        if not total_spend:
+            st.info("Click “Load live Meta spend” above to add spend, CPL and ROAS.")
         metrics = pd.DataFrame([
             {"Metric": "Meta spend", "Value": total_spend},
             {"Metric": "New leads", "Value": len(new_leads)},
@@ -450,15 +470,23 @@ def render_historical_business(
         st.dataframe(metrics, hide_index=True, use_container_width=True)
         if not meta_spend.empty and {"date", "spend"}.issubset(meta_spend.columns):
             daily = meta_spend.groupby("date", as_index=False)["spend"].sum()
-            st.plotly_chart(px.line(daily, x="date", y="spend", markers=True, title="Daily Meta spend"), use_container_width=True)
+            st.plotly_chart(
+                px.line(daily, x="date", y="spend", markers=True, title="Daily Meta spend"),
+                use_container_width=True,
+            )
+        return
 
-    with tabs[5]:
-        leakage = order_value - closed_revenue
-        unmatched = int(joined["crm_outcome"].eq("NOT FOUND IN CRM").sum())
-        st.markdown("#### Automated business insights")
-        st.write(f"- Revenue leakage from agent-created value to final closed revenue: **AED {leakage:,.2f}**.")
-        st.write(f"- Final order-to-close conversion: **{close_rate:.1f}%**.")
-        st.write(f"- Cancellation/return ratio after agent conversion: **{cancel_rate:.1f}%**.")
-        st.write(f"- Records not matched to Sales CRM: **{unmatched:,}**.")
-        st.markdown("#### Row-level reconciliation")
-        st.dataframe(joined, hide_index=True, use_container_width=True)
+    leakage = order_value - closed_revenue
+    unmatched = int(joined["crm_outcome"].eq("NOT FOUND IN CRM").sum())
+    st.markdown("#### Automated business insights")
+    st.write(f"- Revenue leakage from agent-created value to final closed revenue: **AED {leakage:,.2f}**.")
+    st.write(f"- Final order-to-close conversion: **{close_rate:.1f}%**.")
+    st.write(f"- Cancellation/return ratio after agent conversion: **{cancel_rate:.1f}%**.")
+    st.write(f"- Records not matched to Sales CRM: **{unmatched:,}**.")
+    st.markdown("#### Row-level reconciliation")
+    show_rows = st.checkbox("Load detailed reconciliation rows", value=False)
+    if show_rows:
+        row_limit = st.selectbox("Rows to display", [250, 500, 1000, 2500], index=0)
+        st.dataframe(joined.head(row_limit), hide_index=True, use_container_width=True)
+        if len(joined) > row_limit:
+            st.caption(f"Showing {row_limit:,} of {len(joined):,} rows.")
