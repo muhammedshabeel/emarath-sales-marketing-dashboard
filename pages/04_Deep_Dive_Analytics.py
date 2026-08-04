@@ -73,8 +73,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.spinner("Opening cached historical dataset…"):
-    data = load_historical_dataset()
+if not st.session_state.get("deep_dataset_open", False):
+    st.info("Deep Dive is memory-intensive. The historical dataset stays unloaded until you open it.")
+    if st.button("Open deep-dive analytics", type="primary", use_container_width=True):
+        st.session_state["deep_dataset_open"] = True
+        st.rerun()
+    st.stop()
+
+try:
+    with st.spinner("Opening cached historical dataset…"):
+        data = load_historical_dataset()
+except Exception as exc:
+    st.session_state["deep_dataset_open"] = False
+    st.error(f"Historical data could not be opened safely: {exc}")
+    st.info("Return to the main app for current operations, or retry after the app recovers.")
+    st.stop()
 
 if data.empty:
     st.error("Historical dataset is empty.")
